@@ -1397,10 +1397,19 @@ import Network
 
     private var requestedTerminalID: String?
     private var requestedTerminalSize: (id: String, columns: Int, rows: Int)?
+    // Explicitly typed so Swift 6.1 does not time out inferring the array of optional fallbacks.
+    private func terminalScope(threadID: String?) -> [String] {
+        let profileID: String = profile?.id.uuidString ?? ""
+        let target: String = targetID ?? ""
+        let instance: String = instanceID ?? ""
+        let currentEpoch: String = epoch ?? ""
+        return [profileID, target, instance, currentEpoch, threadID ?? ""]
+    }
+
     func createTerminal() async {
         guard state == .live, !creatingTerminal, capabilities.contains("terminal.create"),
               let client, let threadID = selectedThreadID else { return }
-        let scope = [profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? "", threadID]
+        let scope = terminalScope(threadID: threadID)
         let receiptKey = "zedlink.terminalCreate.\(scope.joined(separator: "."))"
         let requestID = UserDefaults.standard.string(forKey: receiptKey) ?? UUID().uuidString
         UserDefaults.standard.set(requestID, forKey: receiptKey)
@@ -1409,10 +1418,10 @@ import Network
         do {
             let params: [String: Any] = ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": threadID]
             for _ in 0..<10 {
-                guard scope == [profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? "", selectedThreadID ?? ""],
+                guard scope == terminalScope(threadID: selectedThreadID),
                       state == .live, capabilities.contains("terminal.create") else { return }
                 let result = try await client.rpc("terminal.create", params: params, requestID: requestID)
-                guard scope == [profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? "", selectedThreadID ?? ""] else { return }
+                guard scope == terminalScope(threadID: selectedThreadID) else { return }
                 if result["outcome"] as? String == "ready" {
                     guard let row = result["terminal"] as? [String: Any], let terminal = Self.decodeTerminal(row) else { throw GatewayFailure.invalidResponse }
                     terminals.removeAll { $0.id == terminal.id }; terminals.append(terminal)
@@ -1426,7 +1435,7 @@ import Network
             issue = "Terminal is still starting. Tap New terminal again to check the same request."
         } catch is CancellationError { return }
         catch {
-            if scope == [profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? "", selectedThreadID ?? ""] {
+            if scope == terminalScope(threadID: selectedThreadID) {
                 issue = "\(error.localizedDescription) New terminal checks the same request without creating a duplicate."
             }
         }

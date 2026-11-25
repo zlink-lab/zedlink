@@ -56,7 +56,7 @@ Increment Android versionCode and versionName for each APK-affecting update, and
 
 ## GitHub Actions budget
 
-The owner's Actions allowance is nearly exhausted and there is no budget for overages. Keep Android/macOS workflows manual-only. Do not dispatch hosted builds, re-enable automatic triggers, or launch cloud validation without explicit owner approval. Use local verification; report native app compilation as NOT RUN when the local toolchain is unavailable.
+This is the public `zlink-lab/zedlink` fork, so hosted Actions minutes (including macOS) are free. `ci.yml` runs on every push and pull request; `zed.yml`, `macos-smoke.yml` and `android-smoke.yml` run automatically only when their paths change. Simulator, emulator and other long-running jobs stay behind `workflow_dispatch` inputs. Actions are disabled on `zlink-lab/zed`; all CI lives here.
 
 
 ## Local build memory

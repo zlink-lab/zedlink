@@ -38,94 +38,19 @@ struct SessionsView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     connectionHeader
-                    if session.demoPreview { Text("DEMO PREVIEW · Sample sessions, no live connection").font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16).padding(.vertical, 8) }
-                    if !session.issue.isEmpty { SessionIssueBanner() }
-                    if session.visibleThreads.contains(where: { thread in !session.threads.contains(where: { $0.id == thread.id }) }) {
-                        Text(session.state == .live ? "Saved sessions · expose in desktop Zed to update" : session.state == .connecting ? "Saved sessions · reconciling with desktop Zed" : "Saved sessions · reconnect to update")
-                            .font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16).padding(.vertical, 8)
-                    }
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 16) {
-                            ForEach(["All", "Needs attention", "Running", "Pinned"], id: \.self) { label in
-                                Button { filter = label; dismissZedLinkKeyboard() } label: {
-                                    Text(label).font(.subheadline).foregroundStyle(filter == label ? ZLTheme.ink : ZLTheme.muted)
-                                        .frame(minHeight: 44).overlay(alignment: .bottom) { if filter == label { Rectangle().fill(ZLTheme.ink).frame(height: 2) } }
-                                }.buttonStyle(.plain).accessibilityIdentifier("session-filter-" + label)
-                            }
-                        }.padding(.horizontal, 16)
-                    }
+                    sessionNotices
+                    filterBar
                     Hairline()
-                    if session.state == .live && session.capabilities.contains("thread.create") {
-                        Button { showingNewSession = true } label: {
-                            Label("New Agent session", systemImage: "plus.circle.fill")
-                                .frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 44)
-                        }.buttonStyle(.bordered).padding(.horizontal, 16).padding(.vertical, 10)
-                    }
-                    if !recentThreads.isEmpty {
-                        SectionLabel("Recently opened").padding(.horizontal, 16).padding(.top, 8)
-                        ForEach(recentThreads) { thread in
-                            NavigationLink(value: thread.id) {
-                                SessionRow(thread: thread, live: session.state == .live && session.threads.contains(where: { $0.id == thread.id }), updated: library.updated.contains(key(thread)))
-                            }.buttonStyle(.plain).accessibilityIdentifier("thread-" + thread.id)
-                                .allowsHitTesting(!session.demoPreview)
-                                .simultaneousGesture(TapGesture().onEnded { dismissZedLinkKeyboard(); library.opened(key(thread)) })
-                            Hairline().padding(.leading, 16)
-                        }
-                    }
-                    if visibleThreads.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(session.profile == nil ? "Choose a connection" : session.visibleThreads.isEmpty ? (session.state == .live ? "No exposed sessions" : "Sessions unavailable") : "No matching sessions").font(.headline)
-                            Text(session.profile == nil ? "Pair a private gateway in Connections." : session.visibleThreads.isEmpty ? (session.state == .live ? "Expose a conversation with /remote-control in desktop Zed, or create a session using +." : "Reconnect to refresh your sessions.") : "Try another search or filter.").font(.subheadline).foregroundStyle(ZLTheme.muted)
-                            if session.profile == nil {
-                                Button("Open Connections") { session.showConnections = true }
-                                    .buttonStyle(ZLPrimaryButtonStyle())
-                            } else if session.state != .live {
-                                Button("Reconnect") { Task { await session.refresh() } }
-                                    .buttonStyle(.bordered).disabled(session.state == .connecting || session.state == .reconnecting)
-                            } else if session.visibleThreads.isEmpty && session.capabilities.contains("thread.create") {
-                                Button("Create Agent session") { showingNewSession = true }
-                                    .buttonStyle(.bordered)
-                            }
-                        }.padding(20)
-                    }
-                    ForEach(groups, id: \.self) { group in
-                        let rows = visibleThreads.filter { thread in
-                            SessionActivity(thread).group == group && !recentThreads.contains { $0.id == thread.id }
-                        }
-                        if !rows.isEmpty {
-                            HStack { SectionLabel(group); Spacer(); Text("\(rows.count)").font(.caption.monospaced()).foregroundStyle(ZLTheme.muted) }
-                                .padding(.horizontal, 16).padding(.top, 18).padding(.bottom, 6)
-                            ForEach(rows) { thread in
-                                HStack(spacing: 0) {
-                                    NavigationLink(value: thread.id) {
-                                        SessionRow(thread: thread, live: session.state == .live && session.threads.contains(where: { $0.id == thread.id }), updated: library.updated.contains(key(thread)))
-                                    }.buttonStyle(.plain).accessibilityIdentifier("thread-" + thread.id)
-                                        .allowsHitTesting(!session.demoPreview)
-                                        .simultaneousGesture(TapGesture().onEnded { dismissZedLinkKeyboard(); library.opened(key(thread)) })
-                                    Button { library.toggle(key(thread)) } label: {
-                                        Image(systemName: library.pins.contains(key(thread)) ? "pin.fill" : "pin")
-                                            .foregroundStyle(library.pins.contains(key(thread)) ? ZLTheme.focus : ZLTheme.muted).frame(width: 44, height: 44)
-                                    }.accessibilityLabel(library.pins.contains(key(thread)) ? "Unpin session" : "Pin session").accessibilityIdentifier("pin-" + thread.id)
-                                }
-                                Hairline().padding(.leading, 16)
-                            }
-                        }
-                    }
+                    newSessionButton
+                    recentSection
+                    emptyState
+                    groupedSections
                 }.padding(.bottom, 16)
             }.background(ZLTheme.background).scrollDismissesKeyboard(.interactively)
                 .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search sessions and agents")
                 .onSubmit(of: .search) { dismissZedLinkKeyboard() }
                 .toolbar(.visible, for: .navigationBar).navigationTitle("Sessions").navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { showingNewSession = true } label: { Image(systemName: "plus") }
-                            .disabled(session.state != .live || !session.capabilities.contains("thread.create")).accessibilityLabel("Create Agent session")
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button { Task { await session.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                            .disabled(session.profile == nil).accessibilityLabel("Refresh sessions").accessibilityIdentifier("reconnect")
-                    }
-                }
+                .toolbar { sessionsToolbar }
                 .sheet(isPresented: $showingNewSession) { NewSessionView() }
                 .navigationDestination(for: String.self) { ConversationView(threadID: $0) }
                 .onChange(of: session.threads, initial: true) { _, threads in
@@ -135,6 +60,155 @@ struct SessionsView: View {
                     if let thread { dismissZedLinkKeyboard(); navigationPath = [thread]; session.notificationThreadID = nil }
                 }
                 .refreshable { await session.refresh() }
+        }
+    }
+
+    // Split out of `body` because Swift 6.1 cannot type-check the combined expression in time.
+    private var hasSavedOnlySessions: Bool {
+        session.visibleThreads.contains(where: { thread in !session.threads.contains(where: { $0.id == thread.id }) })
+    }
+
+    private var savedSessionsText: String {
+        switch session.state {
+        case .live: return "Saved sessions · expose in desktop Zed to update"
+        case .connecting: return "Saved sessions · reconciling with desktop Zed"
+        default: return "Saved sessions · reconnect to update"
+        }
+    }
+
+    @ViewBuilder private var sessionNotices: some View {
+        if session.demoPreview { Text("DEMO PREVIEW · Sample sessions, no live connection").font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16).padding(.vertical, 8) }
+        if !session.issue.isEmpty { SessionIssueBanner() }
+        if hasSavedOnlySessions {
+            Text(savedSessionsText)
+                .font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16).padding(.vertical, 8)
+        }
+    }
+
+    private var filterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 16) {
+                ForEach(["All", "Needs attention", "Running", "Pinned"], id: \.self) { label in
+                    filterButton(label)
+                }
+            }.padding(.horizontal, 16)
+        }
+    }
+
+    private func filterButton(_ label: String) -> some View {
+        let selected: Bool = filter == label
+        return Button { filter = label; dismissZedLinkKeyboard() } label: {
+            Text(label).font(.subheadline).foregroundStyle(selected ? ZLTheme.ink : ZLTheme.muted)
+                .frame(minHeight: 44).overlay(alignment: .bottom) { if selected { Rectangle().fill(ZLTheme.ink).frame(height: 2) } }
+        }.buttonStyle(.plain).accessibilityIdentifier("session-filter-" + label)
+    }
+
+    @ViewBuilder private var newSessionButton: some View {
+        if session.state == .live && session.capabilities.contains("thread.create") {
+            Button { showingNewSession = true } label: {
+                Label("New Agent session", systemImage: "plus.circle.fill")
+                    .frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 44)
+            }.buttonStyle(.bordered).padding(.horizontal, 16).padding(.vertical, 10)
+        }
+    }
+
+    private func isLive(_ thread: NativeThread) -> Bool {
+        session.state == .live && session.threads.contains(where: { $0.id == thread.id })
+    }
+
+    private func sessionLink(_ thread: NativeThread) -> some View {
+        NavigationLink(value: thread.id) {
+            SessionRow(thread: thread, live: isLive(thread), updated: library.updated.contains(key(thread)))
+        }.buttonStyle(.plain).accessibilityIdentifier("thread-" + thread.id)
+            .allowsHitTesting(!session.demoPreview)
+            .simultaneousGesture(TapGesture().onEnded { dismissZedLinkKeyboard(); library.opened(key(thread)) })
+    }
+
+    @ViewBuilder private var recentSection: some View {
+        if !recentThreads.isEmpty {
+            SectionLabel("Recently opened").padding(.horizontal, 16).padding(.top, 8)
+            ForEach(recentThreads) { thread in
+                sessionLink(thread)
+                Hairline().padding(.leading, 16)
+            }
+        }
+    }
+
+    private var emptyTitle: String {
+        if session.profile == nil { return "Choose a connection" }
+        if !session.visibleThreads.isEmpty { return "No matching sessions" }
+        return session.state == .live ? "No exposed sessions" : "Sessions unavailable"
+    }
+
+    private var emptyDetail: String {
+        if session.profile == nil { return "Pair a private gateway in Connections." }
+        if !session.visibleThreads.isEmpty { return "Try another search or filter." }
+        return session.state == .live
+            ? "Expose a conversation with /remote-control in desktop Zed, or create a session using +."
+            : "Reconnect to refresh your sessions."
+    }
+
+    @ViewBuilder private var emptyState: some View {
+        if visibleThreads.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(emptyTitle).font(.headline)
+                Text(emptyDetail).font(.subheadline).foregroundStyle(ZLTheme.muted)
+                if session.profile == nil {
+                    Button("Open Connections") { session.showConnections = true }
+                        .buttonStyle(ZLPrimaryButtonStyle())
+                } else if session.state != .live {
+                    Button("Reconnect") { Task { await session.refresh() } }
+                        .buttonStyle(.bordered).disabled(session.state == .connecting || session.state == .reconnecting)
+                } else if session.visibleThreads.isEmpty && session.capabilities.contains("thread.create") {
+                    Button("Create Agent session") { showingNewSession = true }
+                        .buttonStyle(.bordered)
+                }
+            }.padding(20)
+        }
+    }
+
+    private func rows(in group: String) -> [NativeThread] {
+        visibleThreads.filter { thread in
+            SessionActivity(thread).group == group && !recentThreads.contains { $0.id == thread.id }
+        }
+    }
+
+    private func pinButton(_ thread: NativeThread) -> some View {
+        let pinned: Bool = library.pins.contains(key(thread))
+        return Button { library.toggle(key(thread)) } label: {
+            Image(systemName: pinned ? "pin.fill" : "pin")
+                .foregroundStyle(pinned ? ZLTheme.focus : ZLTheme.muted).frame(width: 44, height: 44)
+        }.accessibilityLabel(pinned ? "Unpin session" : "Pin session").accessibilityIdentifier("pin-" + thread.id)
+    }
+
+    private var groupedSections: some View {
+        ForEach(groups, id: \.self) { group in
+            groupSection(group, rows: rows(in: group))
+        }
+    }
+
+    @ViewBuilder private func groupSection(_ group: String, rows: [NativeThread]) -> some View {
+        if !rows.isEmpty {
+            HStack { SectionLabel(group); Spacer(); Text("\(rows.count)").font(.caption.monospaced()).foregroundStyle(ZLTheme.muted) }
+                .padding(.horizontal, 16).padding(.top, 18).padding(.bottom, 6)
+            ForEach(rows) { thread in
+                HStack(spacing: 0) {
+                    sessionLink(thread)
+                    pinButton(thread)
+                }
+                Hairline().padding(.leading, 16)
+            }
+        }
+    }
+
+    @ToolbarContentBuilder private var sessionsToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) {
+            Button { showingNewSession = true } label: { Image(systemName: "plus") }
+                .disabled(session.state != .live || !session.capabilities.contains("thread.create")).accessibilityLabel("Create Agent session")
+        }
+        ToolbarItem(placement: .topBarTrailing) {
+            Button { Task { await session.refresh() } } label: { Image(systemName: "arrow.clockwise") }
+                .disabled(session.profile == nil).accessibilityLabel("Refresh sessions").accessibilityIdentifier("reconnect")
         }
     }
     private var connectionHeader: some View {
@@ -287,6 +361,11 @@ private struct SessionRow: View {
     }
 
     var body: some View {
+        withDialogs(withInputSheets(withSheets(withLifecycle(conversationContent))))
+    }
+
+    // `body` is split into these pieces because Swift 6.1 cannot type-check it as one expression in time.
+    private var conversationContent: some View {
         VStack(spacing: 0) {
             SessionIssueBanner()
             if let snapshot = session.snapshot, snapshot.threadID == threadID {
@@ -299,34 +378,11 @@ private struct SessionRow: View {
                 conversation(snapshot)
                     .onAppear { session.markConversationVisible() }
                 if session.state == .live, let error = snapshot.agentError {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Label(error.title, systemImage: "exclamationmark.triangle")
-                            .font(.footnote.weight(.semibold))
-                        if error.message.count > 240 {
-                            Text(error.message).font(.footnote).lineLimit(2)
-                            DisclosureGroup("Full error details", isExpanded: $showingAgentErrorDetails) {
-                                ScrollView {
-                                    Text(error.message).font(.footnote).textSelection(.enabled)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }.frame(maxHeight: 120)
-                            }.font(.footnote)
-                        } else {
-                            Text(error.message)
-                                .font(.footnote)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .textSelection(.enabled)
-                        }
-                        if error.retrying { Text("Desktop Zed is retrying this request.").font(.footnote) }
-                    }.foregroundStyle(ZLTheme.warning).padding(.horizontal, 12).padding(.vertical, 8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(ZLTheme.surface).accessibilityIdentifier("native-agent-error")
+                    agentErrorBanner(error)
                 }
                 if session.state == .live && (session.editReview != nil || !session.queuedMessages.isEmpty) { nativeControls }
             } else if let cached = session.cachedConversation(threadID) {
-                let detail = session.state != .live ? "Reconnect for current state and earlier messages."
-                    : session.threads.contains(where: { $0.id == threadID }) ? "Loading current state from desktop Zed."
-                    : "This thread is not currently exposed."
-                savedConversationBanner("Saved copy from \(cached.updatedAt.formatted(date: .abbreviated, time: .shortened)). \(detail)")
+                savedConversationBanner("Saved copy from \(cached.updatedAt.formatted(date: .abbreviated, time: .shortened)). \(cachedConversationDetail)")
                 if cached.entries.count > cachedVisibleCount {
                     Button("Show earlier saved messages · \(cached.entries.count - cachedVisibleCount) remaining") {
                         followsConversation = false
@@ -338,38 +394,105 @@ private struct SessionRow: View {
                 conversation(cached.displaySnapshot(visibleCount: cachedVisibleCount))
                     .onAppear { session.markConversationVisible() }
             } else {
-                VStack(spacing: 12) {
-                    ContentUnavailableView(session.state == .live && !session.threads.contains(where: { $0.id == threadID }) ? "Session is not exposed" : "Loading native thread", systemImage: "bubble.left", description: Text("Keep this conversation exposed with /remote-control in desktop Zed. Its contents will reload when it becomes available."))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if session.state != .live { recoveryAction.padding(.bottom, 16) }
-                    else if session.threads.contains(where: { $0.id == threadID }) {
-                        Button("Reload conversation") { Task { await session.select(threadID) } }
-                            .buttonStyle(.bordered).padding(.bottom, 16)
-                    } else { Button("Back to sessions") { dismiss() }.buttonStyle(.bordered).padding(.bottom, 16) }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                unavailableState
             }
         }
+    }
+
+    private var isExposed: Bool { session.threads.contains(where: { $0.id == threadID }) }
+
+    private var cachedConversationDetail: String {
+        if session.state != .live { return "Reconnect for current state and earlier messages." }
+        return isExposed ? "Loading current state from desktop Zed." : "This thread is not currently exposed."
+    }
+
+    private var unavailableTitle: String {
+        session.state == .live && !isExposed ? "Session is not exposed" : "Loading native thread"
+    }
+
+    private func agentErrorBanner(_ error: NativeAgentError) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(error.title, systemImage: "exclamationmark.triangle")
+                .font(.footnote.weight(.semibold))
+            if error.message.count > 240 {
+                Text(error.message).font(.footnote).lineLimit(2)
+                DisclosureGroup("Full error details", isExpanded: $showingAgentErrorDetails) {
+                    ScrollView {
+                        Text(error.message).font(.footnote).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(maxHeight: 120)
+                }.font(.footnote)
+            } else {
+                Text(error.message)
+                    .font(.footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            if error.retrying { Text("Desktop Zed is retrying this request.").font(.footnote) }
+        }.foregroundStyle(ZLTheme.warning).padding(.horizontal, 12).padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(ZLTheme.surface).accessibilityIdentifier("native-agent-error")
+    }
+
+    private var unavailableState: some View {
+        VStack(spacing: 12) {
+            ContentUnavailableView(unavailableTitle, systemImage: "bubble.left", description: Text("Keep this conversation exposed with /remote-control in desktop Zed. Its contents will reload when it becomes available."))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if session.state != .live { recoveryAction.padding(.bottom, 16) }
+            else if isExposed {
+                Button("Reload conversation") { Task { await session.select(threadID) } }
+                    .buttonStyle(.bordered).padding(.bottom, 16)
+            } else { Button("Back to sessions") { dismiss() }.buttonStyle(.bordered).padding(.bottom, 16) }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var conversationTaskID: [String] {
+        let profileID: String = session.profile?.id.uuidString ?? ""
+        let targetID: String = session.targetID ?? ""
+        let instanceID: String = session.instanceID ?? ""
+        let epoch: String = session.epoch ?? ""
+        return [threadID, profileID, targetID, instanceID, epoch, String(session.state == .live), String(isExposed)]
+    }
+
+    private func loadConversation() async {
+        guard session.state == .live, session.threads.contains(where: { $0.id == threadID }) else { return }
+        if let profile = session.profile, let targetID = session.targetID {
+            let recentKey = SessionLibrary.key(profile: profile.gatewayID, target: targetID, thread: threadID)
+            if library.recent.first != recentKey { library.opened(recentKey) }
+        }
+        lastKnownTitle = session.threads.first { $0.id == threadID }?.title ?? "Agent thread"
+        if session.selectedThreadID != threadID || session.snapshot == nil { await session.select(threadID) }
+        if let snapshot = session.snapshot, snapshot.threadID == threadID, !snapshot.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { lastKnownTitle = snapshot.title }
+    }
+
+    private func withLifecycle<Content: View>(_ content: Content) -> some View {
+        content
         .background(ZLTheme.background)
         .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         .safeAreaInset(edge: .top, spacing: 0) { conversationHeader }
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
-        .task(id: [threadID, session.profile?.id.uuidString ?? "", session.targetID ?? "", session.instanceID ?? "", session.epoch ?? "", String(session.state == .live), String(session.threads.contains(where: { $0.id == threadID }))]) {
-            guard session.state == .live, session.threads.contains(where: { $0.id == threadID }) else { return }
-            if let profile = session.profile, let targetID = session.targetID {
-                let recentKey = SessionLibrary.key(profile: profile.gatewayID, target: targetID, thread: threadID)
-                if library.recent.first != recentKey { library.opened(recentKey) }
-            }
-            lastKnownTitle = session.threads.first { $0.id == threadID }?.title ?? "Agent thread"
-            if session.selectedThreadID != threadID || session.snapshot == nil { await session.select(threadID) }
-            if let snapshot = session.snapshot, snapshot.threadID == threadID, !snapshot.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { lastKnownTitle = snapshot.title }
-        }
+        .task(id: conversationTaskID) { await loadConversation() }
         .onChange(of: session.snapshot?.title) { _, title in
             if session.snapshot?.threadID == threadID, let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { lastKnownTitle = title }
         }
         .onChange(of: session.cachedConversations.count, initial: true) { _, _ in
             if let title = session.cachedConversation(threadID)?.title, lastKnownTitle.isEmpty { lastKnownTitle = title }
         }
+        .task(id: composerPhoto) {
+            guard let composerPhoto else { return }
+            let scope = session.operationScope
+            do {
+                guard let raw = try await composerPhoto.loadTransferable(type: Data.self),
+                      let image = UIImage(data: raw), scope == session.operationScope else { return }
+                imageToReview = image
+            } catch { if scope == session.operationScope { session.reportIssue("Image unavailable: " + error.localizedDescription) } }
+            self.composerPhoto = nil
+        }
+    }
+
+    private func withSheets<Content: View>(_ content: Content) -> some View {
+        content
         .sheet(isPresented: $showingAgentHistory) { SubagentHistoryView() }
         .sheet(isPresented: $showingConversationSearch) {
             ConversationSearchSheet(threadID: threadID) { index in
@@ -382,6 +505,43 @@ private struct SessionRow: View {
         .sheet(isPresented: Binding(get: { selectedChildID != nil }, set: { if !$0 { selectedChildID = nil } })) {
             if let id = selectedChildID { SubagentReader(childID: id) }
         }
+        .sheet(isPresented: Binding(get: { imageToReview != nil }, set: { if !$0 { imageToReview = nil; editingAttachmentID = nil } })) {
+            if let imageToReview {
+                ImageAnnotationView(image: imageToReview, cancel: { self.imageToReview = nil; editingAttachmentID = nil }) { data in
+                    if let editingAttachmentID, let index = session.attachments.firstIndex(where: { $0.id == editingAttachmentID }) {
+                        session.attachments[index] = PromptAttachment(name: session.attachments[index].name, mimeType: "image/jpeg", data: data)
+                    } else { session.addImage(data) }
+                    self.imageToReview = nil; editingAttachmentID = nil
+                }
+            }
+        }
+        .sheet(isPresented: $showingModelControls) { SessionModelControls() }
+        .sheet(isPresented: Binding(get: { selectedElicitationID != nil }, set: { if !$0 { selectedElicitationID = nil } })) {
+            NavigationStack {
+                ScrollView {
+                    if let elicitation = session.elicitations.first(where: { $0.id == selectedElicitationID }) {
+                        NativeElicitationView(elicitation: elicitation)
+                            .id((session.operationScope + [elicitation.id]).joined(separator: "\n"))
+                            .padding(16)
+                    } else {
+                        ContentUnavailableView("Request completed", systemImage: "checkmark.circle")
+                    }
+                }
+                .background(ZLTheme.background)
+                .navigationTitle("Input requested")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Close") { selectedElicitationID = nil } } }
+            }
+        }
+        .confirmationDialog("Run desktop action?", isPresented: Binding(get: { session.localCommandConfirmation != nil }, set: { if !$0 { session.localCommandConfirmation = nil } })) {
+            Button("Run /" + (session.localCommandConfirmation?.name ?? "")) { Task { await session.confirmLocalCommand() } }
+        } message: { Text(session.localCommandConfirmation?.confirmation ?? "Confirm this desktop action.") }
+        .onChange(of: session.localExposureStopped) { _, stopped in if stopped { dismiss() } }
+        .sheet(isPresented: $showingContext) { NativeContextSheet(initialTab: contextInitialTab) }
+    }
+
+    private func withInputSheets<Content: View>(_ content: Content) -> some View {
+        content
         .sheet(isPresented: $showingCommands, onDismiss: {
             if pendingCommandReplacement != nil { showingCommandReplacement = true }
             else if focusComposerAfterCommand { composerFocused = true; focusComposerAfterCommand = false }
@@ -418,49 +578,10 @@ private struct SessionRow: View {
             focusComposerAfterCommand = false
             focusComposerAfterInputSheet = false
         }
-        .sheet(isPresented: Binding(get: { imageToReview != nil }, set: { if !$0 { imageToReview = nil; editingAttachmentID = nil } })) {
-            if let imageToReview {
-                ImageAnnotationView(image: imageToReview, cancel: { self.imageToReview = nil; editingAttachmentID = nil }) { data in
-                    if let editingAttachmentID, let index = session.attachments.firstIndex(where: { $0.id == editingAttachmentID }) {
-                        session.attachments[index] = PromptAttachment(name: session.attachments[index].name, mimeType: "image/jpeg", data: data)
-                    } else { session.addImage(data) }
-                    self.imageToReview = nil; editingAttachmentID = nil
-                }
-            }
-        }
-        .sheet(isPresented: $showingModelControls) { SessionModelControls() }
-        .sheet(isPresented: Binding(get: { selectedElicitationID != nil }, set: { if !$0 { selectedElicitationID = nil } })) {
-            NavigationStack {
-                ScrollView {
-                    if let elicitation = session.elicitations.first(where: { $0.id == selectedElicitationID }) {
-                        NativeElicitationView(elicitation: elicitation)
-                            .id((session.operationScope + [elicitation.id]).joined(separator: "\n"))
-                            .padding(16)
-                    } else {
-                        ContentUnavailableView("Request completed", systemImage: "checkmark.circle")
-                    }
-                }
-                .background(ZLTheme.background)
-                .navigationTitle("Input requested")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Close") { selectedElicitationID = nil } } }
-            }
-        }
-        .confirmationDialog("Run desktop action?", isPresented: Binding(get: { session.localCommandConfirmation != nil }, set: { if !$0 { session.localCommandConfirmation = nil } })) {
-            Button("Run /" + (session.localCommandConfirmation?.name ?? "")) { Task { await session.confirmLocalCommand() } }
-        } message: { Text(session.localCommandConfirmation?.confirmation ?? "Confirm this desktop action.") }
-        .onChange(of: session.localExposureStopped) { _, stopped in if stopped { dismiss() } }
-        .sheet(isPresented: $showingContext) { NativeContextSheet(initialTab: contextInitialTab) }
-        .task(id: composerPhoto) {
-            guard let composerPhoto else { return }
-            let scope = session.operationScope
-            do {
-                guard let raw = try await composerPhoto.loadTransferable(type: Data.self),
-                      let image = UIImage(data: raw), scope == session.operationScope else { return }
-                imageToReview = image
-            } catch { if scope == session.operationScope { session.reportIssue("Image unavailable: " + error.localizedDescription) } }
-            self.composerPhoto = nil
-        }
+    }
+
+    private func withDialogs<Content: View>(_ content: Content) -> some View {
+        content
         .confirmationDialog("Clear uncertain delivery?", isPresented: $showingClearConfirmation) {
             Button("Clear locally", role: .destructive) { session.clearPending() }
         } message: {
