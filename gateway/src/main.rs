@@ -74,6 +74,7 @@ struct Inner {
 struct ApnsProvider {
     team_id: String,
     key_id: String,
+    topic: String,
     key_pem: String,
     client: HttpClient,
 }
@@ -638,6 +639,19 @@ fn new_vapid_private_key() -> String {
     }
 }
 
+/// Bundle id of the TestFlight build (.github/workflows/ios-testflight.yml); ZEDLINK_APNS_TOPIC overrides it.
+const DEFAULT_APNS_TOPIC: &str = "cx.m42.zlink";
+
+fn valid_apns_topic(topic: &str) -> bool {
+    !topic.is_empty()
+        && topic.len() <= 155
+        && !topic.starts_with('.')
+        && !topic.ends_with('.')
+        && topic
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+}
+
 fn valid_apns_token(token: &str) -> bool {
     (32..=512).contains(&token.len())
         && token.len().is_multiple_of(2)
@@ -653,6 +667,15 @@ impl ApnsProvider {
         };
         let team_id = std::env::var("ZEDLINK_APNS_TEAM_ID").context("APNs team ID missing")?;
         let key_id = std::env::var("ZEDLINK_APNS_KEY_ID").context("APNs key ID missing")?;
+        // The bundle id of the iOS app the device tokens belong to; the TestFlight build's by default.
+        let topic = match std::env::var("ZEDLINK_APNS_TOPIC") {
+            Ok(topic) => topic,
+            Err(std::env::VarError::NotPresent) => DEFAULT_APNS_TOPIC.to_string(),
+            Err(_) => bail!("invalid APNs topic"),
+        };
+        if !valid_apns_topic(&topic) {
+            bail!("invalid APNs topic");
+        }
         if ![&team_id, &key_id].iter().all(|id| {
             id.len() == 10
                 && id
@@ -676,6 +699,7 @@ impl ApnsProvider {
         Ok(Some(Self {
             team_id,
             key_id,
+            topic,
             key_pem,
             client,
         }))
@@ -716,7 +740,7 @@ impl ApnsProvider {
         let request =
             isahc::Request::post(format!("https://{host}/3/device/{}", registration.token))
                 .header("authorization", format!("bearer {token}"))
-                .header("apns-topic", "dev.zedlink.app")
+                .header("apns-topic", self.topic.as_str())
                 .header("apns-push-type", "alert")
                 .header("apns-expiration", "0")
                 .header("content-type", "application/json")
@@ -2373,6 +2397,16 @@ mod tests {
     }
 
     #[test]
+    fn apns_topics_are_bundle_ids() {
+        assert!(valid_apns_topic(DEFAULT_APNS_TOPIC));
+        assert!(valid_apns_topic("dev.zedlink.app"));
+        assert!(!valid_apns_topic(""));
+        assert!(!valid_apns_topic(".cx.m42.zlink"));
+        assert!(!valid_apns_topic("cx.m42.zlink\r\napns-priority: 10"));
+        assert!(!valid_apns_topic("cx.m42/zlink"));
+    }
+
+    #[test]
     fn apns_tokens_are_bounded_and_provider_claims_are_scoped() -> Result<()> {
         assert!(valid_apns_token(&"ab".repeat(32)));
         assert!(!valid_apns_token("ab/../device"));
@@ -2380,6 +2414,7 @@ mod tests {
         let provider = ApnsProvider {
             team_id: "ABCDEFGHIJ".into(),
             key_id: "KLMNOPQRST".into(),
+            topic: DEFAULT_APNS_TOPIC.into(),
             key_pem: ES256KeyPair::generate().to_pem()?,
             client: HttpClient::new()?,
         };
