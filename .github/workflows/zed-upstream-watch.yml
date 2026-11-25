@@ -1,0 +1,96 @@
+# Watches Zed's stable releases. When one is newer than the version zed-source.env pins, it tries
+# the ZedLink commit on top of the new release and opens (or updates) an issue that says whether it
+# applies cleanly or which files conflict. Porting itself is a person's (or an agent's) job: push
+# zedlink/v<version> to the Zed fork, update zed-source.env, tag zed-v<version>-zlink.1.
+name: Zed upstream watch
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare the pin with Zed's latest stable release
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          grep -E '^ZED_[A-Z_]+=' zed-source.env >> "$GITHUB_ENV"
+          . ./zed-source.env
+          pinned=${ZED_BRANCH##*/v}
+          latest=$(gh api repos/zed-industries/zed/releases/latest --jq .tag_name)
+          latest=${latest#v}
+          echo "pinned $pinned, latest stable $latest"
+          newest=$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | tail -1)
+          if [ "$latest" = "$pinned" ] || [ "$newest" = "$pinned" ]; then
+            echo "up to date"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "latest=$latest" >> "$GITHUB_OUTPUT"
+            echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Try the ZedLink commit on the new release
+        id: try
+        if: steps.compare.outputs.new == 'true'
+        run: |
+          git init -q zed && cd zed
+          git config user.name ci && git config user.email ci@localhost
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git remote add fork "https://github.com/$ZED_REPOSITORY.git"
+          git fetch -q --depth 2 fork "$ZED_REF"
+          git fetch -q --depth 1 upstream "refs/tags/v${{ steps.compare.outputs.latest }}:refs/tags/new"
+          git checkout -q new
+          # One commit on top of the old release: apply its diff with a three-way merge.
+          git diff "$ZED_REF~1" "$ZED_REF" > ../zedlink.patch
+          if git apply --3way ../zedlink.patch 2> ../apply.log; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=conflicts" >> "$GITHUB_OUTPUT"
+          fi
+          conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/')
+          {
+            echo "conflicts<<EOF"
+            echo "${conflicts:-none}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          tail -20 ../apply.log || true
+
+      - name: Open or update the issue
+        if: steps.compare.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.compare.outputs.latest }}
+          PINNED: ${{ steps.compare.outputs.pinned }}
+          RESULT: ${{ steps.try.outputs.result }}
+          CONFLICTS: ${{ steps.try.outputs.conflicts }}
+        run: |
+          title="Zed v$LATEST: port ZedLink (pinned v$PINNED)"
+          body="Zed v$LATEST is out; zed-source.env pins v$PINNED ($ZED_REF).
+
+          The ZedLink commit on top of v$LATEST (git apply --3way): **$RESULT**.
+
+          Conflicting files:
+          $CONFLICTS
+
+          To release: branch zedlink/v$LATEST in $ZED_REPOSITORY from tag v$LATEST with the ZedLink
+          commit ported, point zed-source.env at it, then tag zed-v$LATEST-zlink.1 (zed-release.yml).
+
+          Checked by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          existing=$(gh issue list --state open --search "in:title \"Zed v$LATEST: port ZedLink\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
