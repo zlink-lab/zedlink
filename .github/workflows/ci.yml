@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gateway:
+    name: Gateway and protocol
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            protocol-core
+            gateway
+      - name: Test protocol core
+        run: cargo test --manifest-path protocol-core/Cargo.toml --locked
+      - name: Check gateway formatting
+        run: cargo fmt --manifest-path gateway/Cargo.toml -- --check
+      - name: Test gateway
+        run: cargo test --manifest-path gateway/Cargo.toml --locked
+      - name: Build gateway
+        run: cargo build --release --manifest-path gateway/Cargo.toml --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zedlink-gateway-linux-x86_64
+          path: gateway/target/release/zedlink-gateway
+          retention-days: 14
+
+  web:
+    name: Web client
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check web client syntax
+        run: |
+          node --check gateway/web/app.js
+          node --check gateway/web/ui.js
+          node --check gateway/web/service-worker.js
+      - name: Run web client tests
+        run: |
+          node tools/test_web_push_worker.js
+          node tools/test_web_commands.js
+          node tools/test_web_dictation.js

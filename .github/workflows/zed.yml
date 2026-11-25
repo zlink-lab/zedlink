@@ -1,0 +1,109 @@
+name: Patched Zed
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - zed-source.env
+      - tools/**
+      - gateway/**
+      - protocol-core/**
+      - .github/workflows/zed.yml
+  pull_request:
+    paths:
+      - zed-source.env
+      - tools/**
+      - gateway/**
+      - protocol-core/**
+      - .github/workflows/zed.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    name: Build patched Zed and run native smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Full release LTO takes hours on a hosted runner; the smoke test only needs a working binary.
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Read Zed source pin
+        run: grep -E '^ZED_[A-Z_]+=' zed-source.env >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ZED_REPOSITORY }}
+          ref: ${{ env.ZED_REF }}
+          path: zed-source
+          fetch-depth: 1
+
+      - name: Install Zed build dependencies
+        run: |
+          zed-source/script/linux
+          sudo apt-get install -y --no-install-recommends xvfb mesa-vulkan-drivers
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            zed-source
+            gateway
+          key: ${{ env.ZED_REF }}
+          cache-on-failure: true
+
+      - name: Check ZedLink crates
+        working-directory: zed-source
+        run: cargo check -p agent_ui -p settings_ui
+
+      - name: Build patched Zed
+        working-directory: zed-source
+        run: cargo build --release -p zed
+
+      - name: Build gateway
+        run: cargo build --manifest-path gateway/Cargo.toml --locked
+
+      - name: Run native agent smoke test
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: |
+          # The smoke test expects the binary at the debug path used by tools/install_linux.sh.
+          mkdir -p zed-source/target/debug
+          ln -sf ../release/zed zed-source/target/debug/zed
+          cd tools
+          xvfb-run -a -s '-screen 0 1920x1080x24' python3 test_native_agent_smoke.py
+
+      - name: Collect smoke logs
+        if: failure()
+        run: |
+          mkdir -p /tmp/zedlink-smoke-logs
+          find /tmp -maxdepth 2 -path '/tmp/zedlink-native-agent-smoke-*' -name '*.log' \
+            -exec cp --parents {} /tmp/zedlink-smoke-logs \; || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: zedlink-smoke-logs
+          path: /tmp/zedlink-smoke-logs
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-zedlink-linux-x86_64
+          path: zed-source/target/release/zed
+          retention-days: 7
