@@ -1275,6 +1275,7 @@ async function loadThreads() {
   }
   state.threads = result.threads;
   state.lastThreadsAt = Date.now();
+  refreshRecentHistory();
   if (state.threadId && nextSelected) {
     const title = selectedThreadTitle(state.threadId);
     if ($("thread-title").textContent !== title) $("thread-title").textContent = title;
@@ -1538,7 +1539,8 @@ function clearSessionSearch() {
   $("session-search").focus();
 }
 function renderThreads() {
-  const signature = JSON.stringify([state.threads.map((thread) => [thread.thread_id, thread.title, thread.agent, thread.status, thread.current_turn_id, thread.had_error, thread.agent_error, thread.retry_status, thread.approval_count, thread.input_count, thread.project]), state.threadId, state.live, sessionFilter, $("session-search").value, $("session-tag-filter").value, [...sessionPins()], sessionTags(), sessionSeen(), [...sessionUpdated]]);
+  const signature = JSON.stringify([state.threads.map((thread) => [thread.thread_id, thread.title, thread.agent, thread.status, thread.current_turn_id, thread.had_error, thread.agent_error, thread.retry_status, thread.approval_count, thread.input_count, thread.project]), state.threadId, state.live, sessionFilter, $("session-search").value, $("session-tag-filter").value, [...sessionPins()], sessionTags(), sessionSeen(), [...sessionUpdated], recentHistoryThreads().map((thread) => thread.thread_id)]);
+  renderRecentHistory();
   if (signature === threadsRenderSignature) return;
   threadsRenderSignature = signature;
   const list = $("thread-list"); const scrollTop = list.scrollTop;
@@ -1564,6 +1566,7 @@ function renderThreads() {
     if (activity.running) counts.Running++;
     if (pins.has(thread.thread_id)) counts.Pinned++;
   }
+  counts.Recent = recentHistoryThreads().length;
   for (const button of $("session-filters").querySelectorAll("button[data-filter]")) {
     const count = counts[button.dataset.filter];
     const badge = button.querySelector(".filter-count");
@@ -1580,7 +1583,7 @@ function renderThreads() {
     return sessionFilter === "All" || sessionFilter === "Needs attention" && activity.attention ||
       sessionFilter === "Running" && activity.running || sessionFilter === "Pinned" && pins.has(thread.thread_id);
   }).sort((a, b) => Number(pins.has(b.thread_id)) - Number(pins.has(a.thread_id)) || (Number(seen[b.thread_id]) || 0) - (Number(seen[a.thread_id]) || 0) || (a.title || "").localeCompare(b.title || ""));
-  $("thread-count").textContent = String(visible.length);
+  $("thread-count").textContent = String(sessionFilter === "Recent" ? counts.Recent : visible.length);
   const groups = ["Needs attention", "Running", "Ready & other"].map((group) => ({
     label: group,
     sessions: visible.filter((thread) => { const activity = sessionActivity(thread); return (activity.attention ? "Needs attention" : activity.running ? "Running" : "Ready & other") === group; }).map((thread) => {
@@ -5303,6 +5306,91 @@ function workspaceStatus(message) {
 }
 function showWorkspacesAvailability() {
   $("open-workspaces").classList.toggle("hidden", !state.capabilities.includes("workspace.list"));
+}
+// Recent threads from desktop Zed history that are not in the session list yet.
+const RECENT_REFRESH_MS = 30000;
+const recentHistory = { scope: "", at: 0, loading: false, opening: null, error: "", threads: [], signature: "" };
+const recentScope = () => JSON.stringify([state.gatewayId, state.targetId, state.instanceId, state.epoch]);
+function recentThreadsFrom(hosts) {
+  return hosts.flatMap((host) => host.projects.flatMap((project) => project.threads.map((thread) => ({
+    ...thread, project: project.name, host: host.kind === "ssh" ? host.label : "",
+  })))).sort((a, b) => (Date.parse(b.updated_at) || 0) - (Date.parse(a.updated_at) || 0));
+}
+function recentHistoryThreads() {
+  if (recentHistory.scope !== recentScope() || !state.capabilities.includes("thread.open")) return [];
+  const listed = new Set(state.threads.map((thread) => thread.thread_id));
+  const query = $("session-search").value.trim().toLocaleLowerCase();
+  return recentHistory.threads.filter((thread) => !listed.has(thread.thread_id)
+    && `${thread.title} ${thread.agent} ${thread.project} ${thread.host}`.toLocaleLowerCase().includes(query)).slice(0, 30);
+}
+async function refreshRecentHistory() {
+  if (!state.capabilities.includes("workspace.list") || !state.capabilities.includes("thread.open")) return;
+  const scope = recentScope();
+  if (recentHistory.loading || recentHistory.scope === scope && Date.now() - recentHistory.at < RECENT_REFRESH_MS) return;
+  recentHistory.loading = true;
+  try {
+    const hosts = workspaceHostsFrom(await rpc("workspace.list", baseInstanceParams()));
+    if (scope !== recentScope()) return;
+    Object.assign(recentHistory, { scope, at: Date.now(), threads: recentThreadsFrom(hosts) });
+    renderThreads();
+  } catch {
+    // The session list stays usable; the next refresh retries.
+    recentHistory.at = Date.now();
+  } finally {
+    recentHistory.loading = false;
+  }
+}
+function renderRecentHistory() {
+  const available = state.capabilities.includes("workspace.list") && state.capabilities.includes("thread.open");
+  $("session-filters").querySelector('button[data-filter="Recent"]').classList.toggle("hidden", !available);
+  $("desktop-session-filter").querySelector('option[value="Recent"]').hidden = !available;
+  const only = sessionFilter === "Recent";
+  const all = recentHistoryThreads();
+  const shown = only ? all : sessionFilter === "All" ? all.slice(0, 8) : [];
+  const section = $("recent-history");
+  section.classList.toggle("hidden", !only && !shown.length);
+  section.classList.toggle("only", only);
+  $("thread-list").classList.toggle("hidden", only);
+  const signature = JSON.stringify([only, state.live, recentHistory.opening, recentHistory.error, shown.map((thread) => [thread.thread_id, thread.title, historyAge(thread.updated_at)])]);
+  if (signature === recentHistory.signature) return;
+  recentHistory.signature = signature;
+  section.replaceChildren(workspaceElement("p", "recent-heading", "Recent in Zed"));
+  if (recentHistory.error) section.append(workspaceElement("p", "muted", recentHistory.error));
+  if (!shown.length) section.append(workspaceElement("p", "muted", "No other recent threads in desktop Zed."));
+  for (const thread of shown) {
+    const row = workspaceElement("button", "workspace-thread");
+    row.type = "button";
+    row.disabled = !state.live || !!recentHistory.opening;
+    row.append(workspaceElement("strong", "", thread.title || "Untitled thread"));
+    const age = recentHistory.opening === thread.thread_id ? "Loading in Zed…" : historyAge(thread.updated_at);
+    row.append(workspaceElement("small", "", [thread.project, thread.host, thread.agent, age].filter(Boolean).join(" · ")));
+    row.addEventListener("click", () => openRecentThread(thread.thread_id));
+    section.append(row);
+  }
+}
+async function openRecentThread(threadId) {
+  if (recentHistory.opening) return;
+  const scope = recentScope();
+  const exposed = () => state.threads.some((item) => item.thread_id === threadId);
+  Object.assign(recentHistory, { opening: threadId, error: "" });
+  renderRecentHistory();
+  try {
+    await rpc("thread.open", { ...baseInstanceParams(), thread_id: threadId });
+    const deadline = Date.now() + 60000;
+    for (;;) {
+      await loadThreads();
+      if (scope !== recentScope()) return;
+      if (exposed()) break;
+      if (Date.now() > deadline) throw new Error("Zed has not exposed this thread yet. Check desktop Zed, then try again.");
+      await workspaceWait(1000);
+    }
+    selectThread(threadId);
+  } catch (error) {
+    recentHistory.error = error.message;
+  } finally {
+    recentHistory.opening = null;
+    renderThreads();
+  }
 }
 function workspaceElement(tag, className, text) {
   const node = document.createElement(tag);

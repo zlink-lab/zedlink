@@ -415,6 +415,36 @@ struct WorkspaceHost: Identifiable, Equatable {
     var isSSH: Bool { kind == "ssh" }
 }
 
+/// A history thread with the project it belongs to, for the "Recent in Zed" list.
+struct RecentHistoryThread: Identifiable, Equatable {
+    let thread: WorkspaceHistoryThread
+    let project: String
+    let host: String?
+
+    var id: String { thread.id }
+    var searchText: String { [thread.title ?? "", thread.agent, project, host ?? ""].joined(separator: " ") }
+    var meta: String {
+        var parts: [String] = [project]
+        if let host { parts.append(host) }
+        parts.append(thread.agent)
+        if let date = thread.updatedAt { parts.append(date.formatted(.relative(presentation: .named))) }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Newest first, across every host and project.
+    static func recent(in hosts: [WorkspaceHost]) -> [RecentHistoryThread] {
+        var rows: [RecentHistoryThread] = []
+        for host in hosts {
+            for project in host.projects {
+                for thread in project.threads {
+                    rows.append(RecentHistoryThread(thread: thread, project: project.name, host: host.isSSH ? host.label : nil))
+                }
+            }
+        }
+        return rows.sorted { ($0.thread.updatedAt ?? .distantPast) > ($1.thread.updatedAt ?? .distantPast) }
+    }
+}
+
 extension WorkspaceHistoryThread {
     /// Never-sent drafts have no ACP session id; they cannot be opened remotely and are skipped.
     init?(row: [String: Any]) {

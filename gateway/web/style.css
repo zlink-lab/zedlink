@@ -1491,3 +1491,9 @@ body[data-reading-code-wrap="true"] .tool-output pre { white-space: pre-wrap; ov
 .workspace-entry.file { color: var(--subtle); min-height: 0; }
 .host-add-form { display: grid; gap: 8px; margin-top: 8px; }
 .host-add-form input { width: 100%; font-size: 16px; }
+.recent-history { display: grid; align-content: start; gap: 4px; margin-top: 8px; }
+.recent-history.hidden { display: none; }
+.recent-heading { margin: 4px 11px; color: var(--muted); font-size: .64rem; text-transform: uppercase; letter-spacing: .08em; }
+#sessions-panel .recent-history { flex: 0 1 auto; min-height: 0; max-height: 40%; overflow-y: auto; }
+#sessions-panel .recent-history.only { flex: 1 1 auto; max-height: none; }
+@media (max-width: 760px) { #sessions-panel .recent-history { flex: none; max-height: none; overflow: visible; } }

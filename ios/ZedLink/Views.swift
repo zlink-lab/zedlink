@@ -63,6 +63,7 @@ struct SessionsView: View {
                 recentSection
                 emptyState
                 groupedSections
+                historySection
             }.padding(.bottom, 16)
         }.background(ZLTheme.background).scrollDismissesKeyboard(.interactively)
             .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search sessions and agents")
@@ -77,7 +78,13 @@ struct SessionsView: View {
             .onChange(of: session.notificationThreadID) { _, thread in
                 if let thread { dismissZedLinkKeyboard(); navigationPath = [thread]; session.notificationThreadID = nil }
             }
-            .refreshable { await session.refresh() }
+            .task(id: session.supportsRecentHistory && session.state == .live) {
+                while !Task.isCancelled && session.supportsRecentHistory && session.state == .live {
+                    await session.loadWorkspaces()
+                    try? await Task.sleep(for: .seconds(30))
+                }
+            }
+            .refreshable { await session.refresh(); await session.loadWorkspaces() }
     }
 
     @ViewBuilder private var workspacesButton: some View {
@@ -112,10 +119,56 @@ struct SessionsView: View {
         }
     }
 
+    private var filterLabels: [String] {
+        session.supportsRecentHistory ? ["All", "Needs attention", "Running", "Recent", "Pinned"] : ["All", "Needs attention", "Running", "Pinned"]
+    }
+
+    /// Threads from desktop Zed history that are not in the session list yet.
+    private var historyThreads: [RecentHistoryThread] {
+        guard session.state == .live, session.supportsRecentHistory, filter == "All" || filter == "Recent" else { return [] }
+        let listed = Set(session.visibleThreads.map(\.id))
+        let matching = RecentHistoryThread.recent(in: session.workspaceHosts).filter { item in
+            !listed.contains(item.id) && (search.isEmpty || item.searchText.localizedCaseInsensitiveContains(search))
+        }
+        return Array(matching.prefix(filter == "Recent" ? 30 : 8))
+    }
+
+    @ViewBuilder private var historySection: some View {
+        if !historyThreads.isEmpty {
+            SectionLabel("Recent in Zed").padding(.horizontal, 16).padding(.top, 18).padding(.bottom, 6)
+            if !session.workspaceIssue.isEmpty {
+                Text(session.workspaceIssue).font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16)
+            }
+            if let progress = session.workspaceProgress {
+                Text(progress).font(.caption).foregroundStyle(ZLTheme.muted).padding(.horizontal, 16)
+            }
+            ForEach(historyThreads) { item in
+                Button { openHistory(item.thread) } label: {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(item.thread.title ?? "Untitled thread").font(.subheadline.weight(.semibold)).foregroundStyle(ZLTheme.ink).lineLimit(2)
+                        Text(item.meta).font(.caption).foregroundStyle(ZLTheme.muted).lineLimit(1)
+                    }.frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 52)
+                        .padding(.horizontal, 16).contentShape(Rectangle())
+                }.buttonStyle(.plain).disabled(session.workspaceProgress != nil)
+                    .accessibilityIdentifier("recent-thread-" + item.id)
+                Hairline().padding(.leading, 16)
+            }
+        }
+    }
+
+    private func openHistory(_ thread: WorkspaceHistoryThread) {
+        dismissZedLinkKeyboard()
+        session.clearWorkspaceIssue()
+        Task {
+            guard let id = await session.openHistoryThread(thread) else { return }
+            navigationPath = [id]
+        }
+    }
+
     private var filterBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 16) {
-                ForEach(["All", "Needs attention", "Running", "Pinned"], id: \.self) { label in
+                ForEach(filterLabels, id: \.self) { label in
                     filterButton(label)
                 }
             }.padding(.horizontal, 16)
@@ -176,7 +229,7 @@ struct SessionsView: View {
     }
 
     @ViewBuilder private var emptyState: some View {
-        if visibleThreads.isEmpty {
+        if visibleThreads.isEmpty && historyThreads.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Text(emptyTitle).font(.headline)
                 Text(emptyDetail).font(.subheadline).foregroundStyle(ZLTheme.muted)

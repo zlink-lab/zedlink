@@ -26,6 +26,20 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertNil(WorkspaceHost(row: ["kind": "local"]))
     }
 
+    func testRecentHistoryIsNewestFirstAcrossProjects() throws {
+        func project(_ id: String, _ thread: String, _ date: String) -> [String: Any] {
+            ["project_id": id, "paths": ["/p/" + id], "name": id,
+             "threads": [["thread_id": thread, "agent": "Zed Agent", "updated_at": date] as [String: Any]] as [[String: Any]]]
+        }
+        let host = try XCTUnwrap(WorkspaceHost(row: [
+            "host_id": "local", "kind": "local",
+            "projects": [project("a", "old", "2026-11-20T09:00:00Z"), project("b", "new", "2026-11-26T09:00:00Z")],
+        ]))
+        let recent = RecentHistoryThread.recent(in: [host])
+        XCTAssertEqual(recent.map(\.id), ["new", "old"])
+        XCTAssertEqual(recent.first?.project, "b")
+    }
+
     func testHostPathsAndSSHCommands() {
         XCTAssertEqual(HostPath.parent("/home/dev0/prj"), "/home/dev0")
         XCTAssertEqual(HostPath.parent("/home"), "/")

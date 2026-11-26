@@ -1544,6 +1544,7 @@ import Network
     /// Hosts from the last `workspace.list`, only while the same gateway, target and Zed instance are current.
     var workspaceHosts: [WorkspaceHost] { storedWorkspaceScope == workspaceScope ? storedWorkspaceHosts : [] }
     var supportsWorkspaces: Bool { capabilities.contains("workspace.list") }
+    var supportsRecentHistory: Bool { supportsWorkspaces && capabilities.contains("thread.open") }
 
     private var workspaceScope: [String] {
         [generation.uuidString, profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? ""]
