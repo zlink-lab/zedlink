@@ -1,0 +1,113 @@
+# Patched Zed for the desktop, released per Zed version.
+#
+# Builds the Zed that zed-source.env pins (ZedLink on top of a Zed release) with Zed's own
+# script/bundle-linux, so the archive has the layout of the official zed-linux-x86_64.tar.gz
+# (zed.app/bin/zed, libexec/zed-editor, lib/, share/), and publishes it as a GitHub release.
+# Machines that run it turn Zed's own auto-update off and take these releases instead.
+#
+# Tag `zed-v<zed version>-zlink.<n>` (for example zed-v1.29.3-zlink.1) on a commit whose
+# zed-source.env pins that Zed version. The tag must match the version the pin builds, or the job
+# stops before building.
+name: Patched Zed release
+
+on:
+  push:
+    tags: ['zed-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create, zed-v<zed version>-zlink.<n>
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zed-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      CARGO_INCREMENTAL: "0"
+      # The official profile (thin LTO, one codegen unit, limited debug info for Sentry) takes
+      # hours on a hosted runner. A plain optimized build is what we ship; no symbols go anywhere.
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Read Zed source pin
+        run: grep -E '^ZED_[A-Z_]+=' zed-source.env >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ZED_REPOSITORY }}
+          ref: ${{ env.ZED_REF }}
+          path: zed-source
+          fetch-depth: 1
+
+      - name: The tag names the Zed version the pin builds
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' zed-source/crates/zed/Cargo.toml | head -1)
+          channel=$(cat zed-source/crates/zed/RELEASE_CHANNEL)
+          echo "Zed $version ($channel) from $ZED_REPOSITORY $ZED_BRANCH @ $ZED_REF"
+          case "$RELEASE_TAG" in
+            "zed-v$version-zlink."[0-9]*) ;;
+            *) echo "::error::tag $RELEASE_TAG does not match Zed $version (want zed-v$version-zlink.<n>)"; exit 1 ;;
+          esac
+          if [ "$channel" != stable ]; then
+            echo "::error::crates/zed/RELEASE_CHANNEL is «$channel», not stable"; exit 1
+          fi
+          echo "ZED_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install Zed build dependencies
+        run: zed-source/script/linux
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: zed-source
+          key: bundle-${{ env.ZED_REF }}
+          cache-on-failure: true
+
+      # Zed's own packaging: zed with the bundle profile, the cli, the remote server, stripped,
+      # with the shared libraries it needs in lib/. No Sentry upload.
+      - name: Bundle
+        working-directory: zed-source
+        run: script/bundle-linux --skip-sentry
+
+      - name: Checksum
+        run: |
+          mkdir -p dist
+          cp zed-source/target/release/zed-linux-x86_64.tar.gz dist/
+          cd dist
+          sha256sum zed-linux-x86_64.tar.gz > zed-linux-x86_64.tar.gz.sha256
+          cat zed-linux-x86_64.tar.gz.sha256
+          tar -tzf zed-linux-x86_64.tar.gz | head -20
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="Zed $ZED_VERSION with ZedLink, Linux x86_64.
+
+          Source: $ZED_REPOSITORY, branch $ZED_BRANCH, commit $ZED_REF; zedlink $GITHUB_SHA.
+          Built by script/bundle-linux with LTO off and no debug info.
+
+          Install over the official Zed: unpack zed.app to ~/.local/zed.app. Turn Zed's own
+          auto-update off (\"auto_update\": false), or it replaces this build with stock Zed."
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --target "$GITHUB_SHA" \
+              --title "Zed $ZED_VERSION + ZedLink (${RELEASE_TAG#zed-v$ZED_VERSION-})" --notes "$notes"
+          fi
