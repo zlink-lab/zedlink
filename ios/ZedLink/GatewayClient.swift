@@ -32,6 +32,9 @@ enum GatewayFailure: LocalizedError {
             case "THREAD_NOT_EXPOSED": "This thread is no longer exposed in desktop Zed."
             case "INSTANCE_UNAVAILABLE": "Desktop Zed is unavailable."
             case "RESYNC_REQUIRED": "Event history changed; refreshing the native snapshot."
+            case "HOST_UNAVAILABLE": "Zed could not connect to that host. Check desktop Zed for a password prompt or error."
+            case "INVALID_COMMAND": "Zed could not read that SSH command. Use the form ssh user@host -p 2222."
+            case "UNSUPPORTED_CAPABILITY": "This action is not enabled in desktop Zed."
             default: code
             }
         }

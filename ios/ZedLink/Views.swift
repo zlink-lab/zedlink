@@ -11,6 +11,8 @@ struct SessionsView: View {
     @State private var search = ""
     @State private var filter = "All"
     @State private var showingNewSession = false
+    @State private var showingWorkspaces = false
+    @State private var workspaceThreadID: String?
     @Binding var navigationPath: [String]
     private let groups = ["Needs attention", "Running", "Ready & other"]
     private func key(_ thread: NativeThread) -> String {
@@ -19,7 +21,7 @@ struct SessionsView: View {
     private var visibleThreads: [NativeThread] {
         session.visibleThreads.filter { thread in
             let activity = SessionActivity(thread)
-            return (search.isEmpty || (thread.title + " " + thread.agentName + " " + thread.id).localizedCaseInsensitiveContains(search)) &&
+            return (search.isEmpty || thread.searchText.localizedCaseInsensitiveContains(search)) &&
                 (filter == "All" || filter == "Needs attention" && activity.attention || filter == "Running" && activity.running || filter == "Pinned" && library.pins.contains(key(thread)))
         }.sorted { left, right in
             let lp = library.pins.contains(key(left)), rp = library.pins.contains(key(right))
@@ -35,31 +37,56 @@ struct SessionsView: View {
     }
     var body: some View {
         NavigationStack(path: $navigationPath) {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    connectionHeader
-                    sessionNotices
-                    filterBar
-                    Hairline()
-                    newSessionButton
-                    recentSection
-                    emptyState
-                    groupedSections
-                }.padding(.bottom, 16)
-            }.background(ZLTheme.background).scrollDismissesKeyboard(.interactively)
-                .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search sessions and agents")
-                .onSubmit(of: .search) { dismissZedLinkKeyboard() }
-                .toolbar(.visible, for: .navigationBar).navigationTitle("Sessions").navigationBarTitleDisplayMode(.inline)
-                .toolbar { sessionsToolbar }
-                .sheet(isPresented: $showingNewSession) { NewSessionView() }
-                .navigationDestination(for: String.self) { ConversationView(threadID: $0) }
-                .onChange(of: session.threads, initial: true) { _, threads in
-                    library.observe(threads, profile: session.profile?.gatewayID ?? "", target: session.targetID ?? "", selected: session.selectedThreadID)
+            sessionsList
+                .sheet(isPresented: $showingWorkspaces, onDismiss: { openWorkspaceThread() }) {
+                    WorkspacesView(openedThreadID: $workspaceThreadID)
                 }
-                .onChange(of: session.notificationThreadID) { _, thread in
-                    if let thread { dismissZedLinkKeyboard(); navigationPath = [thread]; session.notificationThreadID = nil }
-                }
-                .refreshable { await session.refresh() }
+        }
+    }
+
+    private func openWorkspaceThread() {
+        guard let thread = workspaceThreadID else { return }
+        workspaceThreadID = nil
+        dismissZedLinkKeyboard()
+        navigationPath = [thread]
+    }
+
+    private var sessionsList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                connectionHeader
+                sessionNotices
+                filterBar
+                Hairline()
+                newSessionButton
+                workspacesButton
+                recentSection
+                emptyState
+                groupedSections
+            }.padding(.bottom, 16)
+        }.background(ZLTheme.background).scrollDismissesKeyboard(.interactively)
+            .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search sessions and agents")
+            .onSubmit(of: .search) { dismissZedLinkKeyboard() }
+            .toolbar(.visible, for: .navigationBar).navigationTitle("Sessions").navigationBarTitleDisplayMode(.inline)
+            .toolbar { sessionsToolbar }
+            .sheet(isPresented: $showingNewSession) { NewSessionView() }
+            .navigationDestination(for: String.self) { ConversationView(threadID: $0) }
+            .onChange(of: session.threads, initial: true) { _, threads in
+                library.observe(threads, profile: session.profile?.gatewayID ?? "", target: session.targetID ?? "", selected: session.selectedThreadID)
+            }
+            .onChange(of: session.notificationThreadID) { _, thread in
+                if let thread { dismissZedLinkKeyboard(); navigationPath = [thread]; session.notificationThreadID = nil }
+            }
+            .refreshable { await session.refresh() }
+    }
+
+    @ViewBuilder private var workspacesButton: some View {
+        if session.state == .live && session.supportsWorkspaces {
+            Button { showingWorkspaces = true } label: {
+                Label("Projects & thread history", systemImage: "square.stack.3d.up")
+                    .frame(maxWidth: .infinity, alignment: .leading).frame(minHeight: 44)
+            }.buttonStyle(.bordered).padding(.horizontal, 16).padding(.bottom, 10)
+                .accessibilityIdentifier("open-workspaces")
         }
     }
 
@@ -202,6 +229,12 @@ struct SessionsView: View {
     }
 
     @ToolbarContentBuilder private var sessionsToolbar: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            if session.supportsWorkspaces {
+                Button { showingWorkspaces = true } label: { Image(systemName: "square.stack.3d.up") }
+                    .disabled(session.state != .live).accessibilityLabel("Workspaces")
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             Button { showingNewSession = true } label: { Image(systemName: "plus") }
                 .disabled(session.state != .live || !session.capabilities.contains("thread.create")).accessibilityLabel("Create Agent session")
@@ -284,6 +317,11 @@ private struct SessionRow: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var activity: SessionActivity { SessionActivity(thread) }
     private var tint: Color { activity.attention ? ZLTheme.warning : activity.running ? ZLTheme.focus : ZLTheme.muted }
+    @ViewBuilder private var projectLabel: some View {
+        if let project = thread.project {
+            Label(project, systemImage: "folder").font(.caption2).foregroundStyle(ZLTheme.muted).lineLimit(1)
+        }
+    }
     private var activityLabel: String {
         thread.status == "Saved copy" ? "Saved conversation" : activity.running && thread.activity.isWorking ? thread.activity.displayText : activity.rawValue
     }
@@ -293,6 +331,7 @@ private struct SessionRow: View {
                 .symbolEffect(.variableColor, isActive: live && activity.running && !reduceMotion)
                 .foregroundStyle(tint).frame(width: 20)
             VStack(alignment: .leading, spacing: 5) {
+                projectLabel
                 Text(thread.title).font(.body.weight(.medium)).foregroundStyle(ZLTheme.ink).lineLimit(2)
                 Text(thread.agentName + " · " + (live ? "" : "Last known: ") + activityLabel +
                      (activity == .approval ? " (\(thread.approvalCount ?? 0))" : activity == .input ? " (\(thread.inputCount ?? 0))" : ""))

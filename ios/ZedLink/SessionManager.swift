@@ -54,6 +54,11 @@ import Network
     private var summaryCache: [String: (Date, NativeThread)] = [:]
     func isRespondingToElicitation(_ id: String) -> Bool { resolvingElicitations.contains((operationScope + [id]).joined(separator: "\n")) }
     private var diffRequest = UUID()
+    @Published private var storedWorkspaceHosts: [WorkspaceHost] = []
+    private var storedWorkspaceScope: [String] = []
+    @Published private(set) var workspaceLoaded = false
+    @Published private(set) var workspaceProgress: String?
+    @Published private(set) var workspaceIssue = ""
     private var workspaceRequest = UUID()
     private var searchRequest = UUID()
     var operationScope: [String] { [generation.uuidString, profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? "", selectedThreadID ?? ""] }
@@ -678,6 +683,8 @@ import Network
             thread.agentName = (row["agent"] as? [String: Any])?["name"] as? String ?? "Zed Agent"
             thread.retrying = row["retry_status"] is [String: Any]
             thread.failed = row["had_error"] as? Bool == true || row["agent_error"] is [String: Any]
+            let project: String = (row["project"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            thread.project = project.isEmpty ? nil : project
             return thread
         }
         if selectedThreadID == nil && includeSummaries {
@@ -1530,6 +1537,135 @@ import Network
         return NativeTerminal(id: id, title: row["title"] as? String ?? "Terminal",
                               workingDirectory: row["working_directory"] as? String,
                               taskLabel: task?["label"] as? String, taskState: status?["state"] as? String)
+    }
+
+    // MARK: Workspaces (workspace.list / workspace.open / thread.open / host.directory / host.add)
+
+    /// Hosts from the last `workspace.list`, only while the same gateway, target and Zed instance are current.
+    var workspaceHosts: [WorkspaceHost] { storedWorkspaceScope == workspaceScope ? storedWorkspaceHosts : [] }
+    var supportsWorkspaces: Bool { capabilities.contains("workspace.list") }
+
+    private var workspaceScope: [String] {
+        [generation.uuidString, profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? ""]
+    }
+
+    private func workspaceParams(_ extra: [String: Any] = [:]) -> [String: Any] {
+        var params: [String: Any] = ["instance_id": instanceID ?? "", "epoch": epoch ?? ""]
+        params.merge(extra) { _, new in new }
+        return params
+    }
+
+    func workspaceProject(hostID: String, paths: [String]) -> WorkspaceProject? {
+        workspaceHosts.first(where: { $0.id == hostID })?.projects.first(where: { $0.paths == paths })
+    }
+
+    func clearWorkspaceIssue() { workspaceIssue = "" }
+
+    func loadWorkspaces() async {
+        guard capabilities.contains("workspace.list"), let client else { return }
+        let scope = workspaceScope
+        do {
+            let result = try await client.rpc("workspace.list", params: workspaceParams())
+            guard scope == workspaceScope else { return }
+            guard let rows = result["hosts"] as? [[String: Any]] else { throw GatewayFailure.invalidResponse }
+            storedWorkspaceHosts = rows.compactMap { WorkspaceHost(row: $0) }
+            storedWorkspaceScope = scope
+            workspaceLoaded = true
+        } catch {
+            guard scope == workspaceScope, !isCancelledRequest(error) else { return }
+            workspaceIssue = error.localizedDescription
+        }
+    }
+
+    /// Asks Zed to open a project the way its sidebar does (connecting over SSH itself), then polls
+    /// `workspace.list` until the project reports `open`.
+    func openWorkspace(host: WorkspaceHost, paths: [String], name: String) async -> Bool {
+        guard capabilities.contains("workspace.open"), let client, workspaceProgress == nil, !paths.isEmpty else { return false }
+        let scope = workspaceScope
+        workspaceIssue = ""
+        workspaceProgress = host.isSSH
+            ? "Opening \(name) on \(host.label). Zed may ask for a password on the desktop…"
+            : "Opening \(name)…"
+        defer { workspaceProgress = nil }
+        do {
+            let result = try await client.rpc("workspace.open", params: workspaceParams(["host_id": host.id, "paths": paths]))
+            guard let outcome = result["outcome"] as? String, outcome == "open" || outcome == "opening" else {
+                throw GatewayFailure.invalidResponse
+            }
+            for attempt in 0..<40 {
+                if attempt > 0 || outcome == "opening" { try await Task.sleep(for: .milliseconds(1500)) }
+                await loadWorkspaces()
+                guard scope == workspaceScope else { return false }
+                if workspaceProject(hostID: host.id, paths: paths)?.open == true {
+                    try? await loadThreads(includeSummaries: false)
+                    return true
+                }
+            }
+            throw GatewayFailure.native("Zed is still opening \(name). Check desktop Zed, then refresh.")
+        } catch {
+            if scope == workspaceScope && !isCancelledRequest(error) { workspaceIssue = error.localizedDescription }
+            return false
+        }
+    }
+
+    /// Loads an old thread in Zed if needed and returns its id once `thread.list` exposes it.
+    func openHistoryThread(_ thread: WorkspaceHistoryThread) async -> String? {
+        if thread.loaded && threads.contains(where: { $0.id == thread.id }) { return thread.id }
+        guard capabilities.contains("thread.open"), let client, workspaceProgress == nil else { return nil }
+        let scope = workspaceScope
+        workspaceIssue = ""
+        workspaceProgress = "Loading \(thread.title ?? "thread") in Zed…"
+        defer { workspaceProgress = nil }
+        do {
+            let result = try await client.rpc("thread.open", params: workspaceParams(["thread_id": thread.id]))
+            guard let outcome = result["outcome"] as? String, outcome == "loading" || outcome == "loaded" else {
+                throw GatewayFailure.invalidResponse
+            }
+            for attempt in 0..<60 {
+                if attempt > 0 { try await Task.sleep(for: .seconds(1)) }
+                try await loadThreads(includeSummaries: false)
+                guard scope == workspaceScope else { return nil }
+                if threads.contains(where: { $0.id == thread.id }) { return thread.id }
+            }
+            throw GatewayFailure.native("Zed has not exposed this thread yet. Check desktop Zed, then try again.")
+        } catch {
+            if scope == workspaceScope && !isCancelledRequest(error) { workspaceIssue = error.localizedDescription }
+            return nil
+        }
+    }
+
+    /// One `host.directory` request. The caller repeats it (about every 700 ms) until `.ready`.
+    func hostDirectory(hostID: String, path: String) async throws -> HostDirectoryState {
+        guard capabilities.contains("host.directory"), let client else { throw GatewayFailure.native("UNSUPPORTED_CAPABILITY") }
+        let result = try await client.rpc("host.directory", params: workspaceParams(["host_id": hostID, "path": path]))
+        let phase: String = result["state"] as? String ?? ""
+        switch phase {
+        case "connecting": return .connecting
+        case "loading": return .loading
+        case "ready":
+            guard let resolved = result["path"] as? String, let rows = result["entries"] as? [[String: Any]] else {
+                throw GatewayFailure.invalidResponse
+            }
+            let entries: [HostDirectoryEntry] = rows.compactMap { row -> HostDirectoryEntry? in
+                guard let name = row["name"] as? String, !name.isEmpty, name != ".", name != ".." else { return nil }
+                return HostDirectoryEntry(name: name, isDirectory: row["is_dir"] as? Bool ?? false)
+            }.sorted { left, right in
+                if left.isDirectory != right.isDirectory { return left.isDirectory }
+                return left.name.localizedStandardCompare(right.name) == .orderedAscending
+            }
+            return .ready(HostDirectoryListing(path: resolved, entries: entries))
+        default:
+            throw GatewayFailure.invalidResponse
+        }
+    }
+
+    /// Saves an SSH server in Zed from an `ssh user@host -p 2222` command and returns its host id.
+    func addHost(command: String) async throws -> String {
+        guard capabilities.contains("host.add"), let client else { throw GatewayFailure.native("UNSUPPORTED_CAPABILITY") }
+        let result = try await client.rpc("host.add", params: workspaceParams(["command": command]))
+        guard let hostID = result["host_id"] as? String, !hostID.isEmpty else { throw GatewayFailure.invalidResponse }
+        await loadWorkspaces()
+        return hostID
     }
 
     func loadDirectory(_ path: String) async {

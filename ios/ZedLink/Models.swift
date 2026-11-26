@@ -79,6 +79,10 @@ struct NativeThread: Identifiable, Equatable {
     var approvalCount: Int? = nil
     var inputCount: Int? = nil
     var activity = NativeAgentActivity.ready
+    /// Display name of the Zed project that owns this thread, when desktop Zed reports one.
+    var project: String? = nil
+
+    var searchText: String { [title, agentName, id, project ?? ""].joined(separator: " ") }
 }
 
 struct NativeCommand: Identifiable, Equatable {
@@ -380,3 +384,141 @@ struct ProjectSearchMatch: Identifiable {
 }
 
 enum WorkspacePage: String { case files, changes, terminal, debug, activity }
+
+// MARK: Workspaces (hosts, projects and thread history reported by desktop Zed)
+
+struct WorkspaceHistoryThread: Identifiable, Equatable {
+    let id: String
+    let title: String?
+    let agent: String
+    let updatedAt: Date?
+    let loaded: Bool
+}
+
+struct WorkspaceProject: Identifiable, Equatable {
+    let id: String
+    let hostID: String
+    let paths: [String]
+    let name: String
+    let open: Bool
+    let threads: [WorkspaceHistoryThread]
+}
+
+struct WorkspaceHost: Identifiable, Equatable {
+    let id: String
+    let kind: String
+    let label: String
+    let detail: String?
+    let connected: Bool
+    let projects: [WorkspaceProject]
+
+    var isSSH: Bool { kind == "ssh" }
+}
+
+extension WorkspaceHistoryThread {
+    /// Never-sent drafts have no ACP session id; they cannot be opened remotely and are skipped.
+    init?(row: [String: Any]) {
+        guard let id = row["thread_id"] as? String, !id.isEmpty else { return nil }
+        let title: String? = (row["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        self.init(id: id, title: title, agent: row["agent"] as? String ?? "Agent",
+                  updatedAt: WorkspaceHistoryThread.date(row["updated_at"] as? String),
+                  loaded: row["loaded"] as? Bool ?? false)
+    }
+
+    static func date(_ text: String?) -> Date? {
+        guard let text else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: text) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: text)
+    }
+}
+
+extension WorkspaceProject {
+    init?(row: [String: Any], hostID: String) {
+        guard let id = row["project_id"] as? String, let rawPaths = row["paths"] as? [String] else { return nil }
+        let paths: [String] = rawPaths.filter { !$0.isEmpty }
+        let rawName: String = row["name"] as? String ?? ""
+        let name: String = rawName.isEmpty ? (paths.first ?? "Untitled project") : rawName
+        let rows: [[String: Any]] = row["threads"] as? [[String: Any]] ?? []
+        let threads: [WorkspaceHistoryThread] = rows.compactMap { WorkspaceHistoryThread(row: $0) }
+        self.init(id: id, hostID: hostID, paths: paths, name: name, open: row["open"] as? Bool ?? false, threads: threads)
+    }
+}
+
+extension WorkspaceHost {
+    init?(row: [String: Any]) {
+        guard let id = row["host_id"] as? String, !id.isEmpty else { return nil }
+        let rows: [[String: Any]] = row["projects"] as? [[String: Any]] ?? []
+        let projects: [WorkspaceProject] = rows.compactMap { WorkspaceProject(row: $0, hostID: id) }
+        let label: String = row["label"] as? String ?? id
+        let detail: String? = (row["detail"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        self.init(id: id, kind: row["kind"] as? String == "ssh" ? "ssh" : "local", label: label.isEmpty ? id : label,
+                  detail: detail, connected: row["connected"] as? Bool ?? false, projects: projects)
+    }
+}
+
+struct HostDirectoryEntry: Identifiable, Equatable {
+    let name: String
+    let isDirectory: Bool
+    var id: String { name }
+}
+
+struct HostDirectoryListing: Equatable {
+    let path: String
+    let entries: [HostDirectoryEntry]
+}
+
+/// One `host.directory` poll result. Callers repeat the request until `.ready`.
+enum HostDirectoryState: Equatable {
+    case connecting
+    case loading
+    case ready(HostDirectoryListing)
+}
+
+/// Path arithmetic for host folders. Hosts may be POSIX or Windows machines.
+enum HostPath {
+    private static func separatorFor(_ path: String) -> String {
+        !path.contains("/") && path.contains("\\") ? "\\" : "/"
+    }
+
+    private static func isDrive(_ path: String) -> Bool {
+        path.count == 2 && path.hasSuffix(":") && (path.first?.isLetter ?? false)
+    }
+
+    private static func isDriveRoot(_ path: String) -> Bool {
+        path.count == 3 && path.hasSuffix(":\\") && (path.first?.isLetter ?? false)
+    }
+
+    static func parent(_ path: String) -> String? {
+        let separator: String = separatorFor(path)
+        var trimmed: String = path
+        if trimmed.count > 1 && trimmed.hasSuffix(separator) && !isDriveRoot(trimmed) { trimmed.removeLast() }
+        if trimmed.isEmpty || trimmed == "/" || trimmed == "~" || isDrive(trimmed) || isDriveRoot(trimmed) { return nil }
+        guard let range = trimmed.range(of: separator, options: .backwards) else { return nil }
+        let parent = String(trimmed[..<range.lowerBound])
+        if parent.isEmpty { return separator }
+        return isDrive(parent) ? parent + "\\" : parent
+    }
+
+    static func child(_ path: String, _ name: String) -> String {
+        let separator: String = separatorFor(path)
+        return path.hasSuffix(separator) ? path + name : path + separator + name
+    }
+
+    static func lastComponent(_ path: String) -> String {
+        let parts = path.split(whereSeparator: { $0 == "/" || $0 == "\\" })
+        return parts.last.map(String.init) ?? path
+    }
+}
+
+enum SSHCommand {
+    /// Accepts `ssh user@host -p 2222` or just `user@host -p 2222`, like Zed's Connect SSH Server dialog.
+    static func normalized(_ text: String) -> String {
+        let command: String = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if command.isEmpty || command == "ssh" { return "" }
+        if command.hasPrefix("ssh ") || command.hasPrefix("ssh\t") { return command }
+        return "ssh " + command
+    }
+}
