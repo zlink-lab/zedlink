@@ -58,3 +58,4 @@ jobs:
           node tools/test_web_push_worker.js
           node tools/test_web_commands.js
           node tools/test_web_dictation.js
+          node tools/test_web_workspaces.js

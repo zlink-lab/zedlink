@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const UI_BUILD = "2026.10.25.2";
+const UI_BUILD = "2026.11.26.1";
 const DELEGATE_TASK_TEMPLATE = "Use the native spawn_agent tool to delegate the following task to a child Zed Agent. Keep the child scoped to this project and return its result in this conversation:\n\nTask: ";
 const state = {
   gatewayId: null,
@@ -231,6 +231,7 @@ function showCreateAvailability() {
   $("new-session").title = available
     ? "Create a native Zed Agent session"
     : "Start patched Zed to create a session";
+  showWorkspacesAvailability();
 }
 
 function renderEmptyWorkspace() {
@@ -676,6 +677,7 @@ async function refreshCapabilities() {
   const info = await rpc("instance.info");
   identity(info);
   state.capabilities = Array.isArray(info.capabilities) ? info.capabilities : [];
+  showWorkspacesAvailability();
 }
 function canStopTurn() {
   return state.live && !!state.threadId && Number.isInteger(state.turnId)
@@ -742,6 +744,8 @@ function apiError(code) {
   if (code === "REQUEST_CONFLICT") return "That request ID was already used for different content.";
   if (code === "THREAD_BUSY") return "Wait for the current Zed turn to finish before changing its settings.";
   if (code === "STALE_SEQUENCE") return "The native thread changed. Refresh it before trying this action again.";
+  if (code === "HOST_UNAVAILABLE") return "Zed could not connect to that host. Check the desktop for a password prompt or error.";
+  if (code === "INVALID_COMMAND") return "Zed could not read that SSH command. Use the form ssh user@host -p 2222.";
   if (code === "FILE_UNAVAILABLE") return "That file is unavailable or excluded from remote project access.";
   if (code === "UNSUPPORTED_FILE") return "That file type cannot be previewed or attached.";
   if (code === "FILE_TOO_LARGE") return "That file is too large to attach. The limit is 256 KiB for text files.";
@@ -1517,6 +1521,9 @@ function sessionActivity(thread) {
   return { label: thread.status === "Idle" ? "Ready" : "Unknown" };
 }
 let threadsRenderSignature = "";
+function threadProject(thread) {
+  return typeof thread?.project === "string" ? thread.project.trim() : "";
+}
 function setSessionFilter(filter) {
   sessionFilter = filter;
   $("desktop-session-filter").value = filter;
@@ -1531,7 +1538,7 @@ function clearSessionSearch() {
   $("session-search").focus();
 }
 function renderThreads() {
-  const signature = JSON.stringify([state.threads.map((thread) => [thread.thread_id, thread.title, thread.agent, thread.status, thread.current_turn_id, thread.had_error, thread.agent_error, thread.retry_status, thread.approval_count, thread.input_count]), state.threadId, state.live, sessionFilter, $("session-search").value, $("session-tag-filter").value, [...sessionPins()], sessionTags(), sessionSeen(), [...sessionUpdated]]);
+  const signature = JSON.stringify([state.threads.map((thread) => [thread.thread_id, thread.title, thread.agent, thread.status, thread.current_turn_id, thread.had_error, thread.agent_error, thread.retry_status, thread.approval_count, thread.input_count, thread.project]), state.threadId, state.live, sessionFilter, $("session-search").value, $("session-tag-filter").value, [...sessionPins()], sessionTags(), sessionSeen(), [...sessionUpdated]]);
   if (signature === threadsRenderSignature) return;
   threadsRenderSignature = signature;
   const list = $("thread-list"); const scrollTop = list.scrollTop;
@@ -1548,7 +1555,7 @@ function renderThreads() {
   }
   $("edit-session-tag").disabled = !state.threadId;
   const searched = state.threads.filter((thread) =>
-    `${thread.title || ""} ${normalizeAgent(thread.agent).name} ${thread.thread_id} ${tags[thread.thread_id] || ""}`.toLocaleLowerCase().includes(query)
+    `${thread.title || ""} ${normalizeAgent(thread.agent).name} ${thread.thread_id} ${tags[thread.thread_id] || ""} ${threadProject(thread)}`.toLocaleLowerCase().includes(query)
     && (!tagSelect.value || tags[thread.thread_id] === tagSelect.value));
   const counts = { All: searched.length, "Needs attention": 0, Running: 0, Pinned: 0 };
   for (const thread of searched) {
@@ -1583,8 +1590,10 @@ function renderThreads() {
         active: thread.thread_id === state.threadId, pinned: pins.has(thread.thread_id), updated: sessionUpdated.has(sessionKey(thread)) };
     }),
   })).filter((group) => group.sessions.length);
+  const projects = new Map(visible.map((thread) => [thread.thread_id, threadProject(thread)]));
   for (const group of groups) for (const session of group.sessions) {
-    session.tag = tags[session.id] || "";
+    // The prebuilt session row has one secondary label; show the Zed project before the local tag.
+    session.tag = [projects.get(session.id), tags[session.id]].filter(Boolean).join(" · ");
     session.seenAt = Number(seen[session.id]) || 0;
   }
   window.ZedLinkSessions.render({
@@ -5205,3 +5214,362 @@ $("action-agent-history").addEventListener("click", () => {
   if (!state.subagents.length) { const empty = document.createElement("p"); empty.textContent = "No parallel agents in this conversation yet."; dialog.append(empty); }
   dialog.showModal();
 });
+
+// Workspaces: hosts, projects and thread history from desktop Zed (workspace.list),
+// opened the way Zed's own sidebar does it (workspace.open / thread.open).
+function workspaceHostsFrom(result) {
+  const text = (value) => typeof value === "string" ? value : "";
+  if (!result || !Array.isArray(result.hosts)) throw new Error("Invalid workspace list.");
+  return result.hosts.filter((host) => host && typeof host.host_id === "string" && host.host_id).map((host) => ({
+    host_id: host.host_id,
+    kind: host.kind === "ssh" ? "ssh" : "local",
+    label: text(host.label) || host.host_id,
+    detail: text(host.detail),
+    connected: host.connected === true,
+    projects: (Array.isArray(host.projects) ? host.projects : [])
+      .filter((project) => project && typeof project.project_id === "string" && Array.isArray(project.paths))
+      .map((project) => ({
+        project_id: project.project_id,
+        host_id: host.host_id,
+        paths: project.paths.filter((path) => typeof path === "string" && path),
+        name: text(project.name) || text(project.paths[0]) || "Untitled project",
+        open: project.open === true,
+        threads: (Array.isArray(project.threads) ? project.threads : [])
+          // Never-sent drafts have no ACP session id and cannot be opened remotely.
+          .filter((thread) => thread && typeof thread.thread_id === "string" && thread.thread_id)
+          .map((thread) => ({
+            thread_id: thread.thread_id,
+            title: text(thread.title),
+            agent: text(thread.agent) || "Agent",
+            updated_at: text(thread.updated_at),
+            loaded: thread.loaded === true,
+          })),
+      })),
+  }));
+}
+function samePaths(left, right) {
+  return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((path, index) => path === right[index]);
+}
+function findWorkspaceProject(hosts, hostId, paths) {
+  const host = hosts.find((item) => item.host_id === hostId);
+  return host ? host.projects.find((project) => samePaths(project.paths, paths)) || null : null;
+}
+function sortedDirectoryEntries(entries) {
+  return (Array.isArray(entries) ? entries : [])
+    .filter((entry) => entry && typeof entry.name === "string" && entry.name && entry.name !== "." && entry.name !== "..")
+    .map((entry) => ({ name: entry.name, is_dir: entry.is_dir === true }))
+    .sort((a, b) => Number(b.is_dir) - Number(a.is_dir) || a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+}
+function pathSeparator(path) {
+  return !path.includes("/") && path.includes("\\") ? "\\" : "/";
+}
+function parentDirectory(path) {
+  if (typeof path !== "string" || !path) return null;
+  const separator = pathSeparator(path);
+  const trimmed = path.length > 1 && path.endsWith(separator) && !/^[A-Za-z]:\\$/.test(path) ? path.slice(0, -1) : path;
+  if (trimmed === "/" || /^[A-Za-z]:\\?$/.test(trimmed)) return null;
+  const index = trimmed.lastIndexOf(separator);
+  if (index < 0) return null;
+  if (index === 0) return separator;
+  const parent = trimmed.slice(0, index);
+  return /^[A-Za-z]:$/.test(parent) ? `${parent}\\` : parent;
+}
+function childDirectory(path, name) {
+  const separator = pathSeparator(path);
+  return path.endsWith(separator) ? `${path}${name}` : `${path}${separator}${name}`;
+}
+function sshCommandFrom(text) {
+  const command = String(text || "").trim();
+  if (!command || command === "ssh") return "";
+  return /^ssh\s/.test(command) ? command : `ssh ${command}`;
+}
+function historyAge(iso, now = Date.now()) {
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return "";
+  const minutes = Math.max(0, Math.round((now - at) / 60000));
+  if (minutes < 1) return "Just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  if (minutes < 48 * 60) return `${Math.floor(minutes / 60)}h ago`;
+  return `${Math.floor(minutes / 1440)}d ago`;
+}
+const workspaces = {
+  view: "list", hosts: [], expanded: new Set(), generation: 0, busy: false,
+  browseHost: null, browsePath: "~", resolvedPath: null, entries: [], browseState: "idle",
+};
+const workspaceWait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function workspaceStatus(message) {
+  $("workspaces-status").textContent = message || "";
+  $("workspaces-status").classList.toggle("hidden", !message);
+}
+function showWorkspacesAvailability() {
+  $("open-workspaces").classList.toggle("hidden", !state.capabilities.includes("workspace.list"));
+}
+function workspaceElement(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+function workspaceButton(label, className, onClick, ariaLabel) {
+  const button = workspaceElement("button", className, label);
+  button.type = "button";
+  if (ariaLabel) button.setAttribute("aria-label", ariaLabel);
+  button.disabled = workspaces.busy;
+  button.addEventListener("click", onClick);
+  return button;
+}
+function setWorkspaceView(view) {
+  workspaces.view = view;
+  const titles = { list: "Workspaces", browse: "Open folder", add: "Add SSH server" };
+  $("workspaces-title").textContent = titles[view] || "Workspaces";
+  $("workspaces-back").classList.toggle("hidden", view === "list");
+  $("workspaces-refresh").classList.toggle("hidden", view === "add");
+  $("host-add-form").classList.toggle("hidden", view !== "add");
+  $("workspaces-body").classList.toggle("hidden", view === "add");
+  renderWorkspaces();
+}
+function renderWorkspaces() {
+  const body = $("workspaces-body");
+  body.replaceChildren();
+  if (workspaces.view === "browse") renderWorkspaceBrowser(body);
+  else if (workspaces.view === "list") renderWorkspaceHosts(body);
+}
+function renderWorkspaceHosts(body) {
+  if (state.capabilities.includes("host.add")) {
+    body.append(workspaceButton("＋ Add SSH server", "quiet workspace-add-host", () => {
+      $("host-add-command").value = "";
+      setWorkspaceView("add");
+      $("host-add-command").focus();
+    }));
+  }
+  if (!workspaces.hosts.length) {
+    body.append(workspaceElement("p", "muted", workspaces.busy ? "Loading…" : "Desktop Zed reported no hosts."));
+    return;
+  }
+  for (const host of workspaces.hosts) body.append(renderWorkspaceHost(host));
+}
+function renderWorkspaceHost(host) {
+  const section = workspaceElement("section", "workspace-host");
+  const head = workspaceElement("div", "workspace-host-head");
+  const label = workspaceElement("div", "workspace-host-label");
+  label.append(workspaceElement("strong", "", host.label));
+  const detail = [host.kind === "ssh" ? "SSH" : host.label === "This computer" ? "" : "This computer", host.detail, host.kind === "ssh" ? (host.connected ? "Connected" : "Not connected") : ""].filter(Boolean).join(" · ");
+  label.append(workspaceElement("small", host.connected ? "online" : "", detail));
+  head.append(label);
+  if (state.capabilities.includes("host.directory") && state.capabilities.includes("workspace.open")) {
+    head.append(workspaceButton("Open folder…", "quiet", () => startWorkspaceBrowse(host), `Browse folders on ${host.label}`));
+  }
+  section.append(head);
+  if (!host.projects.length) section.append(workspaceElement("p", "muted workspace-empty", "No projects yet."));
+  for (const project of host.projects) section.append(renderWorkspaceProject(host, project));
+  return section;
+}
+function renderWorkspaceProject(host, project) {
+  const row = workspaceElement("div", `workspace-project${project.open ? " open" : ""}`);
+  const expanded = workspaces.expanded.has(project.project_id);
+  const toggle = workspaceButton("", "workspace-project-toggle", () => {
+    if (workspaces.expanded.has(project.project_id)) workspaces.expanded.delete(project.project_id);
+    else workspaces.expanded.add(project.project_id);
+    renderWorkspaces();
+  });
+  toggle.disabled = false;
+  toggle.setAttribute("aria-expanded", String(expanded));
+  toggle.append(workspaceElement("span", "workspace-chevron", expanded ? "▾" : "▸"));
+  const text = workspaceElement("span", "workspace-project-text");
+  text.append(workspaceElement("strong", "", project.name));
+  const summary = `${project.open ? "Open" : "Closed"} · ${project.threads.length} thread${project.threads.length === 1 ? "" : "s"}`;
+  text.append(workspaceElement("small", "", `${project.paths.join(", ")}\n${summary}`));
+  toggle.append(text);
+  const head = workspaceElement("div", "workspace-project-head");
+  head.append(toggle);
+  if (!project.open && state.capabilities.includes("workspace.open")) {
+    head.append(workspaceButton("Open", "primary workspace-open", () => openWorkspaceProject(host, project.paths, project.name), `Open ${project.name} in Zed`));
+  }
+  row.append(head);
+  if (expanded) row.append(renderWorkspaceThreads(project));
+  return row;
+}
+function renderWorkspaceThreads(project) {
+  const list = workspaceElement("div", "workspace-threads");
+  if (!project.threads.length) list.append(workspaceElement("p", "muted workspace-empty", "No agent threads in this project."));
+  for (const thread of project.threads) {
+    const exposed = state.threads.some((item) => item.thread_id === thread.thread_id);
+    const canOpen = exposed || state.capabilities.includes("thread.open");
+    const button = workspaceButton("", "workspace-thread", () => openWorkspaceThread(thread));
+    button.disabled = workspaces.busy || !canOpen;
+    button.append(workspaceElement("strong", "", thread.title || "Untitled thread"));
+    const meta = [thread.agent, historyAge(thread.updated_at), thread.loaded ? "" : "Not loaded"].filter(Boolean).join(" · ");
+    button.append(workspaceElement("small", "", meta));
+    list.append(button);
+  }
+  return list;
+}
+function renderWorkspaceBrowser(body) {
+  const host = workspaces.browseHost;
+  if (!host) return;
+  body.append(workspaceElement("p", "workspace-path", `${host.label}: ${workspaces.resolvedPath || workspaces.browsePath}`));
+  if (workspaces.browseState !== "ready") {
+    body.append(workspaceElement("p", "muted", workspaces.browseState === "connecting" ? `Connecting to ${host.label}…` : "Loading folder…"));
+    return;
+  }
+  const open = workspaceButton("Open this folder", "primary workspace-open-folder", () => openWorkspaceProject(host, [workspaces.resolvedPath], workspaces.resolvedPath));
+  body.append(open);
+  const list = workspaceElement("div", "workspace-entries");
+  const parent = parentDirectory(workspaces.resolvedPath);
+  if (parent) list.append(workspaceButton("..", "workspace-entry dir", () => loadWorkspaceDirectory(parent), "Parent folder"));
+  for (const entry of workspaces.entries) {
+    if (entry.is_dir) list.append(workspaceButton(`${entry.name}/`, "workspace-entry dir", () => loadWorkspaceDirectory(childDirectory(workspaces.resolvedPath, entry.name))));
+    else list.append(workspaceElement("div", "workspace-entry file", entry.name));
+  }
+  if (!workspaces.entries.length) list.append(workspaceElement("p", "muted", "This folder is empty."));
+  body.append(list);
+}
+async function loadWorkspaces() {
+  const generation = workspaces.generation;
+  const result = await rpc("workspace.list", baseInstanceParams());
+  if (generation !== workspaces.generation) return false;
+  workspaces.hosts = workspaceHostsFrom(result);
+  if (!workspaces.expanded.size && workspaces.hosts[0]?.projects[0]) workspaces.expanded.add(workspaces.hosts[0].projects[0].project_id);
+  if (workspaces.view === "list") renderWorkspaces();
+  return true;
+}
+async function workspaceTask(message, task) {
+  if (workspaces.busy) return;
+  workspaces.busy = true;
+  workspaceStatus(message);
+  renderWorkspaces();
+  try { await task(workspaces.generation); } catch (error) { workspaceStatus(error.message); } finally {
+    workspaces.busy = false;
+    renderWorkspaces();
+  }
+}
+function openWorkspaces() {
+  workspaces.generation += 1;
+  workspaces.busy = false;
+  setWorkspaceView("list");
+  workspaceStatus("Loading hosts and projects…");
+  $("workspaces-dialog").showModal();
+  loadWorkspaces().then((current) => { if (current) workspaceStatus(""); }).catch((error) => workspaceStatus(error.message));
+}
+function closeWorkspaces() {
+  workspaces.generation += 1;
+  workspaces.busy = false;
+  if ($("workspaces-dialog").open) $("workspaces-dialog").close();
+}
+function openWorkspaceProject(host, paths, name) {
+  workspaceTask(host.kind === "ssh" ? `Opening ${name} on ${host.label}. Zed may ask for a password on the desktop…` : `Opening ${name}…`, async (generation) => {
+    const result = await rpc("workspace.open", { ...baseInstanceParams(), host_id: host.host_id, paths });
+    if (result?.outcome !== "open") {
+      const deadline = Date.now() + 60000;
+      for (;;) {
+        await workspaceWait(1500);
+        if (generation !== workspaces.generation) return;
+        await loadWorkspaces();
+        if (findWorkspaceProject(workspaces.hosts, host.host_id, paths)?.open) break;
+        if (Date.now() > deadline) throw new Error(`Zed is still opening ${name}. Check desktop Zed, then refresh.`);
+      }
+    } else await loadWorkspaces();
+    if (generation !== workspaces.generation) return;
+    const project = findWorkspaceProject(workspaces.hosts, host.host_id, paths);
+    if (project) workspaces.expanded.add(project.project_id);
+    workspaceStatus(`${name} is open in Zed.`);
+    if (workspaces.view !== "list") setWorkspaceView("list");
+    loadThreads().catch(() => {});
+  });
+}
+function openWorkspaceThread(thread) {
+  const exposed = () => state.threads.some((item) => item.thread_id === thread.thread_id);
+  if (thread.loaded && exposed()) {
+    closeWorkspaces();
+    selectThread(thread.thread_id);
+    return;
+  }
+  workspaceTask(`Loading “${thread.title || "Untitled thread"}” in Zed…`, async (generation) => {
+    await rpc("thread.open", { ...baseInstanceParams(), thread_id: thread.thread_id });
+    const deadline = Date.now() + 60000;
+    for (;;) {
+      if (generation !== workspaces.generation) return;
+      await loadThreads();
+      if (exposed()) break;
+      if (Date.now() > deadline) throw new Error("Zed has not exposed this thread yet. Check desktop Zed, then try again.");
+      await workspaceWait(1000);
+    }
+    if (generation !== workspaces.generation) return;
+    closeWorkspaces();
+    selectThread(thread.thread_id);
+  });
+}
+function startWorkspaceBrowse(host) {
+  workspaces.browseHost = host;
+  workspaces.resolvedPath = null;
+  workspaces.entries = [];
+  setWorkspaceView("browse");
+  loadWorkspaceDirectory("~");
+}
+async function loadWorkspaceDirectory(path) {
+  const host = workspaces.browseHost;
+  if (!host) return;
+  const generation = ++workspaces.generation;
+  workspaces.browsePath = path;
+  workspaces.browseState = "loading";
+  workspaceStatus("");
+  renderWorkspaces();
+  const deadline = Date.now() + 60000;
+  try {
+    for (;;) {
+      const result = await rpc("host.directory", { ...baseInstanceParams(), host_id: host.host_id, path });
+      if (generation !== workspaces.generation) return;
+      if (result?.state === "ready" && typeof result.path === "string") {
+        workspaces.resolvedPath = result.path;
+        workspaces.entries = sortedDirectoryEntries(result.entries);
+        workspaces.browseState = "ready";
+        renderWorkspaces();
+        return;
+      }
+      workspaces.browseState = result?.state === "connecting" ? "connecting" : "loading";
+      renderWorkspaces();
+      if (Date.now() > deadline) throw new Error(`${host.label} did not respond. Check desktop Zed, then try again.`);
+      await workspaceWait(700);
+      if (generation !== workspaces.generation) return;
+    }
+  } catch (error) {
+    if (generation !== workspaces.generation) return;
+    workspaceStatus(error.message);
+  }
+}
+async function addWorkspaceHost(event) {
+  event.preventDefault();
+  const command = sshCommandFrom($("host-add-command").value);
+  if (!command) { workspaceStatus("Enter an SSH command such as ssh user@host -p 2222."); return; }
+  $("host-add-submit").disabled = true;
+  workspaceStatus(`Adding ${command}…`);
+  try {
+    const result = await rpc("host.add", { ...baseInstanceParams(), command });
+    workspaces.view = "list";
+    await loadWorkspaces();
+    const host = workspaces.hosts.find((item) => item.host_id === result?.host_id);
+    workspaceStatus(host ? `Added ${host.label}.` : "Server added.");
+    if (host && state.capabilities.includes("host.directory") && state.capabilities.includes("workspace.open")) startWorkspaceBrowse(host);
+    else setWorkspaceView("list");
+  } catch (error) {
+    workspaceStatus(error.message);
+  } finally {
+    $("host-add-submit").disabled = false;
+  }
+}
+$("open-workspaces").addEventListener("click", openWorkspaces);
+$("workspaces-close").addEventListener("click", closeWorkspaces);
+$("workspaces-dialog").addEventListener("cancel", closeWorkspaces);
+$("workspaces-back").addEventListener("click", () => {
+  workspaces.generation += 1;
+  workspaces.busy = false;
+  workspaceStatus("");
+  setWorkspaceView("list");
+  loadWorkspaces().catch((error) => workspaceStatus(error.message));
+});
+$("workspaces-refresh").addEventListener("click", () => {
+  if (workspaces.view === "browse") loadWorkspaceDirectory(workspaces.resolvedPath || workspaces.browsePath);
+  else loadWorkspaces().then(() => workspaceStatus("")).catch((error) => workspaceStatus(error.message));
+});
+$("host-add-form").addEventListener("submit", addWorkspaceHost);
+showWorkspacesAvailability();
