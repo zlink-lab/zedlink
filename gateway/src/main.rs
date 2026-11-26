@@ -1905,36 +1905,11 @@ async fn apns_test(State(state): State<Gateway>, headers: HeaderMap) -> impl Int
     }
 }
 
-async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
-    let Some(device_id) = state.authorize(&headers).await else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"UNAUTHENTICATED"})),
-        );
-    };
-    if body.len() > MAX_RPC {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({"error":"PAYLOAD_TOO_LARGE"})),
-        );
-    }
-    let mut request: Value = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error":"INVALID_REQUEST"})),
-            );
-        }
-    };
-    let Some(method) = request["method"].as_str().map(str::to_owned) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"INVALID_REQUEST"})),
-        );
-    };
-    if !matches!(
-        method.as_str(),
+/// Methods the phone may forward to the native probe. Everything else is refused
+/// before it reaches Zed.
+fn allowed_rpc_method(method: &str) -> bool {
+    matches!(
+        method,
         "instance.list"
             | "session.resume"
             | "instance.info"
@@ -1986,10 +1961,82 @@ async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> i
             | "thread.rewind_image"
             | "thread.rewind"
             | "request.status"
-    ) {
+            | "workspace.list"
+            | "workspace.open"
+            | "thread.open"
+            | "host.directory"
+            | "host.add"
+    )
+}
+
+/// Bounds for the workspace/host methods. The native side validates again; the
+/// gateway only refuses shapes that can never be valid.
+fn valid_workspace_params(method: &str, params: &Value) -> bool {
+    let bounded = |value: &Value, max: usize| {
+        value.as_str().is_some_and(|text| {
+            !text.is_empty() && text.len() <= max && !text.chars().any(char::is_control)
+        })
+    };
+    match method {
+        "workspace.open" => {
+            bounded(&params["host_id"], 256)
+                && params["paths"].as_array().is_some_and(|paths| {
+                    !paths.is_empty()
+                        && paths.len() <= 32
+                        && paths.iter().all(|path| bounded(path, 4096))
+                })
+        }
+        "thread.open" => bounded(&params["thread_id"], 128),
+        "host.directory" => bounded(&params["host_id"], 256) && bounded(&params["path"], 4096),
+        // Zed parses this like its "Connect SSH Server" dialog; it never reaches a shell.
+        "host.add" => {
+            bounded(&params["command"], 512)
+                && params["command"]
+                    .as_str()
+                    .is_some_and(|command| !command.trim().is_empty())
+        }
+        _ => true,
+    }
+}
+
+async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+    let Some(device_id) = state.authorize(&headers).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"UNAUTHENTICATED"})),
+        );
+    };
+    if body.len() > MAX_RPC {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error":"PAYLOAD_TOO_LARGE"})),
+        );
+    }
+    let mut request: Value = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"INVALID_REQUEST"})),
+            );
+        }
+    };
+    let Some(method) = request["method"].as_str().map(str::to_owned) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"INVALID_REQUEST"})),
+        );
+    };
+    if !allowed_rpc_method(&method) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"error":"UNSUPPORTED_CAPABILITY"})),
+        );
+    }
+    if !valid_workspace_params(&method, &request["params"]) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"INVALID_REQUEST"})),
         );
     }
     let Some(original_request_id) = request["request_id"]
@@ -2364,6 +2411,72 @@ async fn event_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_methods_are_allowed_and_bounded() {
+        for method in [
+            "workspace.list",
+            "workspace.open",
+            "thread.open",
+            "host.directory",
+            "host.add",
+            "project.directory",
+        ] {
+            assert!(allowed_rpc_method(method), "{method}");
+        }
+        assert!(!allowed_rpc_method("host.shell"));
+        assert!(!allowed_rpc_method("workspace.delete"));
+
+        assert!(valid_workspace_params("workspace.list", &json!({})));
+        assert!(valid_workspace_params(
+            "workspace.open",
+            &json!({"host_id": "ssh-1", "paths": ["/home/dev0/prj"]})
+        ));
+        assert!(!valid_workspace_params(
+            "workspace.open",
+            &json!({"host_id": "ssh-1", "paths": []})
+        ));
+        assert!(!valid_workspace_params(
+            "workspace.open",
+            &json!({"host_id": "ssh-1", "paths": "/tmp"})
+        ));
+        assert!(!valid_workspace_params(
+            "workspace.open",
+            &json!({"paths": ["/tmp"]})
+        ));
+        assert!(valid_workspace_params(
+            "thread.open",
+            &json!({"thread_id": "abc"})
+        ));
+        assert!(!valid_workspace_params(
+            "thread.open",
+            &json!({"thread_id": null})
+        ));
+        assert!(valid_workspace_params(
+            "host.directory",
+            &json!({"host_id": "local", "path": "~"})
+        ));
+        assert!(!valid_workspace_params(
+            "host.directory",
+            &json!({"host_id": "local", "path": "a\nb"})
+        ));
+        assert!(valid_workspace_params(
+            "host.add",
+            &json!({"command": "ssh dev0@hotbot2 -p 2222"})
+        ));
+        assert!(!valid_workspace_params(
+            "host.add",
+            &json!({"command": "   "})
+        ));
+        assert!(!valid_workspace_params(
+            "host.add",
+            &json!({"command": "ssh a\r\nb"})
+        ));
+        assert!(!valid_workspace_params(
+            "host.add",
+            &json!({"command": "x".repeat(600)})
+        ));
+    }
 
     #[test]
     fn creates_stable_vapid_key_pair() {
