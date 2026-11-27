@@ -23,21 +23,30 @@ import Foundation
         state = defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(State.self, from: $0) } ?? State()
         prune()
     }
-    func enqueue(id: String, data: [String: String], action: String) {
+    func enqueue(id rawID: String, data: [String: String], action: String) {
         prune()
         // Gateway pushes (`push`) only open their thread, like the local review-only alerts. Their
         // instance/epoch may be stale after a Zed restart, so only the routing fields are required.
         let gatewayPush = ["push", "push_test"].contains(data["type"] ?? "")
-        let reviewOnly = gatewayPush || ["agent_error", "turn_status", "compaction", "input_needed"].contains(data["type"] ?? "")
-        let required = gatewayPush ? ["gateway", "thread"]
-            : ["gateway", "target", "instance", "epoch", "thread"] + (reviewOnly ? [] : ["turn", "approval", "child"])
+        // `zed_hung` names a connection and Zed target only: no instance, epoch or thread.
+        let zedAlert = data["type"] == "zed_hung"
+        let reviewOnly = gatewayPush || zedAlert || ["agent_error", "turn_status", "compaction", "input_needed"].contains(data["type"] ?? "")
+        // APNs reuses the collapse id (`<target>:zed_hung`) as the request id for every outage;
+        // `created` tells a later outage apart from a replay of the same alert.
+        let id = zedAlert ? rawID + "@" + (data["created"] ?? "") : rawID
+        let required: [String]
+        if zedAlert { required = ["gateway", "target"] }
+        else if gatewayPush { required = ["gateway", "thread"] }
+        else { required = ["gateway", "target", "instance", "epoch", "thread"] + (reviewOnly ? [] : ["turn", "approval", "child"]) }
         guard id.utf8.count <= 2048, required.allSatisfy({ data[$0] != nil }),
               data.count <= 16, data.values.allSatisfy({ $0.utf8.count <= 2048 }),
               state.consumed[id] == nil, !state.pending.contains(where: { $0.id == id }) else { return }
         let created = data["created"].flatMap { TimeInterval($0) } ?? now()
         guard created.isFinite, now() - created >= 0, now() - created <= lifetime else { return }
         // Older notifications lack a creation timestamp and can only navigate to review.
-        let safeAction = !reviewOnly && data["created"] != nil && ["approve", "deny"].contains(action) ? action : "review"
+        let safeAction: String
+        if zedAlert { safeAction = action == "restart_zed" && data["created"] != nil ? action : "review" }
+        else { safeAction = !reviewOnly && data["created"] != nil && ["approve", "deny"].contains(action) ? action : "review" }
         state.pending.append(Response(id: id, data: data, action: safeAction, created: created))
         if state.pending.count > 16 { state.pending.removeFirst(state.pending.count - 16) }
         save()

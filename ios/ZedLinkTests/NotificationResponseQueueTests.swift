@@ -86,4 +86,33 @@ import XCTest
         queue.enqueue(id: "legacy-push", data: ["type": "push", "gateway": "gateway", "thread": "thread"], action: "approve")
         XCTAssertEqual(queue.claim()?.action, "review")
     }
+
+    func testZedHungAlertNeedsOnlyGatewayAndTargetAndKeepsOnlyRestartAction() throws {
+        let suite = "notification-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let queue = NotificationResponseQueue(defaults: defaults, now: { 1000 })
+        // The gateway's `zed_hung` payload: no instance, epoch or thread.
+        let data = ["type": "zed_hung", "event": "zed_hung", "gateway": "gateway", "target": "target", "created": "1000"]
+        queue.enqueue(id: "zed-restart", data: data, action: "restart_zed")
+        let restart = try XCTUnwrap(queue.claim())
+        XCTAssertEqual(restart.action, "restart_zed")
+        XCTAssertEqual(restart.data["target"], "target")
+        queue.enqueue(id: "zed-tap", data: data, action: "com.apple.UNNotificationDefaultActionIdentifier")
+        XCTAssertEqual(queue.claim()?.action, "review")
+        // Approval actions never pass through a Zed alert.
+        queue.enqueue(id: "zed-approve", data: data, action: "approve")
+        XCTAssertEqual(queue.claim()?.action, "review")
+        // A target is required to know which Zed to restart.
+        queue.enqueue(id: "zed-no-target", data: ["type": "zed_hung", "gateway": "gateway", "created": "1000"], action: "restart_zed")
+        XCTAssertNil(queue.claim())
+        // APNs reuses the collapse id for every outage: a replay is dropped, a later outage is not.
+        let later = NotificationResponseQueue(defaults: defaults, now: { 2000 })
+        later.enqueue(id: "zed-restart", data: data, action: "restart_zed")
+        XCTAssertNil(later.claim())
+        var nextOutage = data
+        nextOutage["created"] = "2000"
+        later.enqueue(id: "zed-restart", data: nextOutage, action: "restart_zed")
+        XCTAssertEqual(later.claim()?.action, "restart_zed")
+    }
 }

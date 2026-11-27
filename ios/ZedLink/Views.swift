@@ -125,6 +125,7 @@ struct SessionsView: View {
 
     @ViewBuilder private var sessionNotices: some View {
         if session.demoPreview { Text("DEMO PREVIEW · Sample sessions, no live connection").font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16).padding(.vertical, 8) }
+        ZedControlBanner()
         if !session.issue.isEmpty { SessionIssueBanner() }
         if !inbox.message.isEmpty {
             Button { inbox.dismissMessage() } label: {
@@ -630,6 +631,7 @@ private struct SessionRow: View {
     // `body` is split into these pieces because Swift 6.1 cannot type-check it as one expression in time.
     private var conversationContent: some View {
         VStack(spacing: 0) {
+            ZedControlBanner()
             SessionIssueBanner()
             if let snapshot = session.snapshot, snapshot.threadID == threadID {
                 if session.state != .live {

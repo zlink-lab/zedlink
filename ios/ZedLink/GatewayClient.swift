@@ -7,6 +7,8 @@ enum GatewayFailure: LocalizedError {
     case redirected
     case status(Int)
     case native(String)
+    /// `zed.restart` refused because Agent turns are running (`TURNS_RUNNING`, with `generating`).
+    case turnsRunning(Int)
 
     var isTransientRouteFailure: Bool {
         guard case .native(let message) = self else { return false }
@@ -32,6 +34,7 @@ enum GatewayFailure: LocalizedError {
         case .changedIdentity: "Gateway identity changed. No device credential was sent."
         case .redirected: "The endpoint redirected. Check the saved address before reconnecting."
         case .status(let status): "Gateway returned HTTP \(status)."
+        case .turnsRunning(let count): "Agent turns are running (\(count)). Restarting Zed would interrupt them."
         case .native(let code):
             switch code {
             case "UNAUTHENTICATED": "Device pairing is missing or revoked."
@@ -138,6 +141,11 @@ struct GatewayClient {
             throw GatewayFailure.invalidResponse
         }
         guard http.statusCode == 200 else {
+            // Gateway-level methods (zed.*) send `{"error":{"code":…}}`; older paths send a string.
+            if let error = object["error"] as? [String: Any], let code = error["code"] as? String {
+                if code == "TURNS_RUNNING" { throw GatewayFailure.turnsRunning(error["generating"] as? Int ?? 0) }
+                throw GatewayFailure.native(code)
+            }
             throw GatewayFailure.native(object["error"] as? String ?? "HTTP \(http.statusCode)")
         }
         return object
@@ -176,6 +184,7 @@ struct GatewayClient {
             throw GatewayFailure.invalidResponse
         }
         if let error = object["error"] as? [String: Any], let code = error["code"] as? String {
+            if code == "TURNS_RUNNING" { throw GatewayFailure.turnsRunning(error["generating"] as? Int ?? 0) }
             throw GatewayFailure.native(code)
         }
         guard let result = object["result"] as? [String: Any] else { throw GatewayFailure.invalidResponse }

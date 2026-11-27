@@ -33,6 +33,7 @@ struct SettingsView: View {
                         SettingsSummary(title: session.profile?.name ?? "Choose a connection", value: "Connections · pair, switch and check")
                     }.accessibilityIdentifier("settings-connections")
                     ConnectionStatusView(state: session.state)
+                    if session.showsZedControl { ZedSettingsRow() }
                     NavigationLink("Diagnostics") { ConnectionDiagnosticsView() }
                     NavigationLink("Resume timing") { ResumeTimingView() }
                 }
@@ -44,7 +45,45 @@ struct SettingsView: View {
                     ConnectionsView(draft: $connectionDraft, embedded: true)
                 }
                 .task { await notifications.refreshStatus() }
+                .task(id: session.profile?.gatewayID ?? "") { _ = await session.refreshZedStatus() }
         }
+    }
+}
+
+/// Zed's own state on the gateway host (`zed.status`) and its start/restart control.
+private struct ZedSettingsRow: View {
+    @EnvironmentObject private var session: SessionManager
+
+    private var color: Color {
+        switch session.zedHealth {
+        case .running: ZLTheme.healthy
+        case .hung, .down: ZLTheme.danger
+        case .starting, .restarting, .unknown: ZLTheme.warning
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Zed").foregroundStyle(ZLTheme.ink)
+                Spacer(minLength: 8)
+                if session.zedHealth == .starting || session.zedHealth == .restarting {
+                    ProgressView().controlSize(.small)
+                }
+                Text(session.zedHealth.label).font(.caption.monospaced().weight(.medium)).foregroundStyle(color)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("settings-zed-status")
+            if !session.zedIssue.isEmpty {
+                Text(session.zedIssue).font(.caption).foregroundStyle(ZLTheme.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if session.canControlZed {
+                ZedControlButton()
+            } else if session.zedStatus != nil {
+                Text("Запуск и перезапуск не настроены на gateway.").font(.caption).foregroundStyle(ZLTheme.muted)
+            }
+        }.padding(.vertical, 4)
     }
 }
 

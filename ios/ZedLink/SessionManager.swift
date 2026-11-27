@@ -164,6 +164,15 @@ import Network
     }
 
     private var client: GatewayClient?
+    /// Zed control (`zed.*`) for the current gateway + target; see the "Zed control" extension.
+    @Published private var zedState = ZedControlState(scope: "")
+    /// The restart confirmation shown at the app root (also after `TURNS_RUNNING`).
+    @Published var zedRestartPrompt: ZedRestartPrompt?
+    /// A `zed_hung` alert was tapped: show the Zed status and restart control.
+    @Published var showZedControl = false
+    private var zedMonitorTask: Task<Void, Never>?
+    private var zedRecoveryTask: Task<Void, Never>?
+    private var zedStatusRefreshing = false
     private var pollTask: Task<Void, Never>?
     private var eventTask: Task<Void, Never>?
     private var cacheTask: Task<Void, Never>?
@@ -325,6 +334,7 @@ import Network
         workspaceFilter = UserDefaults.standard.data(forKey: workspaceFilterKey(nextProfile))
             .flatMap { try? JSONDecoder().decode(WorkspaceFilter.self, from: $0) }
         state = .connecting
+        ensureZedMonitor()
         resumeTrace = ResumeTrace()
         let savedTarget = UserDefaults.standard.string(forKey: targetKey(nextProfile))
         let initialTarget = requestedTargetID ?? previousTarget ?? savedTarget
@@ -468,6 +478,7 @@ import Network
             startEventStream(current)
             if let rememberedThread { Task { [weak self] in await self?.restoreRememberedThread(rememberedThread, current: current) } }
             Task { [weak self] in await self?.syncAPNs() }
+            Task { [weak self] in _ = await self?.refreshZedStatus() }
         } catch {
             guard current == generation else { return }
             if isCancelledRequest(error) {
@@ -486,6 +497,8 @@ import Network
             state = transientRouteFailure && foregroundActive ? .reconnecting : .offline
             issue = error.localizedDescription
             resumeTrace?.finish(); resumeTrace = nil
+            // The gateway may be reachable while Zed is closed or hung; `zed.status` tells which.
+            Task { [weak self] in _ = await self?.refreshZedStatus() }
             if transientRouteFailure && foregroundActive {
                 let delaySeconds = min(60, 5 << min(routeRetryAttempt, 4))
                 pathRetryTask?.cancel()
@@ -564,6 +577,7 @@ import Network
         if let rememberedThread { Task { [weak self] in await self?.restoreRememberedThread(rememberedThread, current: current) } }
         Task { [weak self] in await self?.refreshTargets(current: current) }
         Task { [weak self] in await self?.syncAPNs() }
+        Task { [weak self] in _ = await self?.refreshZedStatus() }
     }
 
     func syncAPNs() async {
@@ -2368,6 +2382,7 @@ import Network
                     if consecutiveFailures >= 2 {
                         state = .reconnecting
                         issue = error.localizedDescription
+                        if consecutiveFailures == 2 { Task { [weak self] in _ = await self?.refreshZedStatus() } }
                     }
                 }
             }
@@ -2399,6 +2414,11 @@ import Network
         for _ in 0..<80 {
             guard state == .connecting else { break }
             do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+        }
+        if data["type"] == "zed_hung", let gateway = data["gateway"] {
+            await handleZedNotification(gatewayID: gateway, targetID: data["target"],
+                                        restart: action == "restart_zed", profiles: profiles)
+            return
         }
         guard state != .connecting else { issue = "Connection is still restoring. Open the session to review current requests."; return }
         if data["type"] == "push_test" { return }
@@ -2666,5 +2686,221 @@ import Network
             pending = try? JSONDecoder().decode(PendingSend.self, from: data)
             if pending != nil { delivery = "Previous send has uncertain delivery. Check its status before another send." }
         }
+    }
+}
+
+// MARK: Zed control (gateway-level `zed.status` / `zed.start` / `zed.restart`)
+
+extension SessionManager {
+    private var zedScope: String { [profile?.gatewayID.lowercased() ?? "", targetID ?? ""].joined(separator: "\n") }
+    /// State for the current gateway + target; another scope's state reads as empty.
+    private var zed: ZedControlState { zedState.scope == zedScope ? zedState : ZedControlState(scope: zedScope) }
+    private func updateZed(_ change: (inout ZedControlState) -> Void) {
+        var next = zed
+        change(&next)
+        zedState = next
+    }
+
+    var zedStatus: ZedControlStatus? { zed.status }
+    var zedIssue: String { zed.issue }
+    var zedOperation: ZedOperation { zed.operation }
+    /// The gateway runs this Zed as a unit and can start or restart it.
+    var canControlZed: Bool { !demoPreview && zed.status?.control == true }
+    /// Known Zed state; a gateway without `zed.*` hides the whole control.
+    var showsZedControl: Bool { !demoPreview && !zed.unsupported && (zed.status != nil || zed.operation != .idle) }
+    var zedHealth: ZedHealth {
+        let current: ZedControlState = zed
+        if current.operation == .restarting || current.status?.restarting == true { return .restarting }
+        if current.operation == .starting { return .starting }
+        if state == .live { return .running }
+        switch current.status?.bridge ?? "" {
+        case "up": return .running
+        case "hung": return .hung
+        case "down": return .down
+        default: return .unknown
+        }
+    }
+    func clearZedIssue() { updateZed { $0.issue = "" } }
+
+    private func zedClient() async -> GatewayClient? {
+        guard !demoPreview, let profile else { return nil }
+        if let client, client.targetID == targetID { return client }
+        guard let token = await CredentialVault.shared.read(profile),
+              profile.id == self.profile?.id else { return nil }
+        return GatewayClient(profile: profile, token: token, targetID: targetID)
+    }
+
+    /// `zed.status`. A gateway without Zed control (HTTP 403 `UNSUPPORTED_CAPABILITY`) is
+    /// remembered for this gateway + target; an unreachable gateway leaves Zed's state unknown.
+    @discardableResult
+    func refreshZedStatus() async -> ZedControlStatus? {
+        guard !zed.unsupported, let client = await zedClient() else { return nil }
+        let scope = zedScope
+        do {
+            let result = try await client.rpc("zed.status")
+            guard scope == zedScope else { return nil }
+            guard let status = ZedControlStatus(result) else { throw GatewayFailure.invalidResponse }
+            updateZed { $0.status = status }
+            return status
+        } catch GatewayFailure.native("UNSUPPORTED_CAPABILITY") {
+            if scope == zedScope { updateZed { $0.unsupported = true; $0.status = nil } }
+        } catch {
+            if scope == zedScope && !isCancelledRequest(error) { updateZed { $0.status = nil } }
+        }
+        return nil
+    }
+
+    /// Polls `zed.status` while the connection is not Live, so a closed or hung Zed is shown
+    /// as such, and reconnects when Zed comes back on its own.
+    private func ensureZedMonitor() {
+        guard zedMonitorTask == nil else { return }
+        zedMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard let self else { return }
+                await self.zedMonitorTick()
+            }
+        }
+    }
+
+    private func zedMonitorTick() async {
+        guard foregroundActive, profile != nil, !demoPreview, !zed.unsupported, zedRecoveryTask == nil,
+              !zedStatusRefreshing, state != .live, state != .connecting else { return }
+        let before: String? = zed.status?.bridge
+        zedStatusRefreshing = true
+        let status = await refreshZedStatus()
+        zedStatusRefreshing = false
+        if let status, status.bridge == "up", let before, before != "up", state == .offline {
+            await refresh()
+        }
+    }
+
+    func startZed() async {
+        guard canControlZed, zed.operation == .idle else { return }
+        let scope = zedScope
+        updateZed { $0.issue = ""; $0.operation = .starting }
+        guard let client = await zedClient(), scope == zedScope else {
+            if scope == zedScope { updateZed { $0.operation = .idle; $0.issue = "Нет соединения с gateway." } }
+            return
+        }
+        do {
+            let result = try await client.rpc("zed.start")
+            guard scope == zedScope else { return }
+            guard result["started"] as? Bool == true || result["already_running"] as? Bool == true else {
+                throw GatewayFailure.invalidResponse
+            }
+            awaitZedReady(previousEpoch: nil, operation: .starting, scope: scope)
+        } catch {
+            guard scope == zedScope else { return }
+            updateZed { $0.operation = .idle; $0.issue = ZedControlText.failure(error) }
+            _ = await refreshZedStatus()
+        }
+    }
+
+    /// Opens the restart confirmation; its button calls `restartZed(force:)`.
+    func requestZedRestart() {
+        guard canControlZed, zed.operation == .idle else { return }
+        zedRestartPrompt = ZedRestartPrompt(generating: nil)
+    }
+
+    /// `zed.restart`. `TURNS_RUNNING` reopens the confirmation with the running-agent count;
+    /// after `accepted` the app waits for a fresh bridge, then resumes the session.
+    func restartZed(force: Bool) async {
+        guard zed.operation == .idle else { return }
+        let scope = zedScope
+        let previousEpoch: String? = zed.status?.epoch ?? epoch
+        updateZed { $0.issue = ""; $0.operation = .restarting }
+        guard let client = await zedClient(), scope == zedScope else {
+            if scope == zedScope { updateZed { $0.operation = .idle; $0.issue = "Нет соединения с gateway." } }
+            return
+        }
+        do {
+            let result = try await client.rpc("zed.restart", params: force ? ["force": true] : [:])
+            guard scope == zedScope else { return }
+            guard result["accepted"] as? Bool == true else { throw GatewayFailure.invalidResponse }
+            awaitZedReady(previousEpoch: previousEpoch, operation: .restarting, scope: scope)
+        } catch GatewayFailure.turnsRunning(let count) {
+            guard scope == zedScope else { return }
+            updateZed { $0.operation = .idle }
+            zedRestartPrompt = ZedRestartPrompt(generating: max(count, 1))
+        } catch {
+            guard scope == zedScope else { return }
+            // A lost reply (or BUSY) can still mean a restart is running; the gateway reports it.
+            if let status = await refreshZedStatus(), status.restarting, scope == zedScope {
+                awaitZedReady(previousEpoch: previousEpoch, operation: .restarting, scope: scope)
+                return
+            }
+            guard scope == zedScope else { return }
+            updateZed { $0.operation = .idle; $0.issue = ZedControlText.failure(error) }
+        }
+    }
+
+    /// Polls `zed.status` until `restarting == false` and the bridge is up with a new epoch
+    /// (any epoch after a start), for up to 90 seconds.
+    private func awaitZedReady(previousEpoch: String?, operation: ZedOperation, scope: String) {
+        updateZed { $0.operation = operation }
+        zedRecoveryTask?.cancel()
+        zedRecoveryTask = Task { [weak self] in
+            let deadline = Date().addingTimeInterval(90)
+            var sawRestarting = false
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard let self, !Task.isCancelled else { return }
+                guard scope == self.zedScope else { self.zedRecoveryTask = nil; return }
+                if let status = await self.refreshZedStatus(), scope == self.zedScope {
+                    if status.restarting {
+                        sawRestarting = true
+                    } else if status.bridge == "up",
+                              operation == .starting || previousEpoch == nil || status.epoch != previousEpoch {
+                        await self.finishZedRecovery(scope: scope, failure: nil)
+                        return
+                    } else if operation == .restarting && sawRestarting {
+                        await self.finishZedRecovery(scope: scope, failure: "Zed не перезапустился. Проверьте Zed на компьютере.")
+                        return
+                    }
+                }
+                if Date() >= deadline {
+                    await self.finishZedRecovery(scope: scope, failure: operation == .starting
+                        ? "Zed не запустился за 90 секунд." : "Zed не перезапустился за 90 секунд.")
+                    return
+                }
+            }
+        }
+    }
+
+    private func finishZedRecovery(scope: String, failure: String?) async {
+        zedRecoveryTask = nil
+        guard scope == zedScope else { return }
+        updateZed { $0.operation = .idle; $0.issue = failure ?? "" }
+        guard failure == nil, let profile else { return }
+        // The normal resume: session.resume with the new epoch, then the THREAD_NOT_LOADED →
+        // thread.open recovery reopens the current thread.
+        await connect(profile, target: targetID)
+    }
+
+    /// A `zed_hung` alert: switch to its connection and target, then restart Zed (the alert's
+    /// action, with the in-app TURNS_RUNNING confirmation) or show Zed's status (a plain tap).
+    func handleZedNotification(gatewayID: String, targetID requestedTarget: String?, restart: Bool,
+                               profiles: [ConnectionProfile]) async {
+        let target: String? = requestedTarget.flatMap { $0.isEmpty ? nil : $0 }
+        let sameGateway: Bool = profile?.gatewayID.caseInsensitiveCompare(gatewayID) == .orderedSame
+        if !sameGateway || (target != nil && target != targetID) {
+            let candidate: ConnectionProfile? = sameGateway ? profile
+                : profiles.first(where: { $0.gatewayID.caseInsensitiveCompare(gatewayID) == .orderedSame })
+            guard let candidate else {
+                issue = "This alert belongs to a connection that is not saved on this iPhone."
+                notificationNeedsWorkspace = true
+                return
+            }
+            await connect(candidate, target: target)
+        }
+        let status = await refreshZedStatus()
+        guard restart else { showZedControl = true; return }
+        guard status?.control == true else {
+            showZedControl = true
+            if status == nil { issue = "Zed control is unavailable on this gateway or the gateway is unreachable." }
+            return
+        }
+        await restartZed(force: false)
     }
 }
