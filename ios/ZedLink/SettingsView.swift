@@ -5,6 +5,7 @@ struct SettingsView: View {
     @EnvironmentObject private var session: SessionManager
     @ObservedObject private var notifications = ApprovalNotifications.shared
     @AppStorage("zedlink.appearance") private var appearance = "dark"
+    @AppStorage(DictationLanguage.storageKey) private var dictationLanguage = "system"
 
     var body: some View {
         NavigationStack {
@@ -15,6 +16,11 @@ struct SettingsView: View {
                         Text("Dark").tag("dark")
                         Text("Light").tag("light")
                     }.accessibilityIdentifier("settings-appearance")
+                    Picker("Dictation language", selection: $dictationLanguage) {
+                        ForEach(DictationLanguage.options) { option in
+                            Text(option.label).tag(option.id)
+                        }
+                    }.accessibilityIdentifier("settings-dictation-language")
                     NavigationLink { NotificationSettingsView() } label: {
                         SettingsSummary(title: "Notifications", value: notifications.status)
                     }

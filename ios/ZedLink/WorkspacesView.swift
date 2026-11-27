@@ -12,6 +12,8 @@ struct WorkspacesView: View {
     @State private var browsingHost: WorkspaceHost?
     @State private var showingAddServer = false
     @State private var addedHostID: String?
+    @State private var newSessionLocation: WorkspaceLocation?
+    @State private var createdThreadID: String?
 
     var body: some View {
         NavigationStack {
@@ -22,6 +24,9 @@ struct WorkspacesView: View {
                 .sheet(item: $browsingHost) { host in HostFolderBrowser(host: host) }
                 .sheet(isPresented: $showingAddServer, onDismiss: { browseAddedHost() }) {
                     AddSSHServerView(addedHostID: $addedHostID)
+                }
+                .sheet(item: $newSessionLocation, onDismiss: { openCreatedThread() }) { location in
+                    NewSessionView(workspace: location) { createdThreadID = $0 }
                 }
                 .task { await loadInitial() }
                 .refreshable { await session.loadWorkspaces() }
@@ -67,7 +72,9 @@ struct WorkspacesView: View {
     private func hostSection(_ host: WorkspaceHost) -> some View {
         Section {
             ForEach(host.projects) { project in
-                WorkspaceProjectRow(host: host, project: project, expanded: expandedBinding(project.id), onOpenThread: { openThread($0) })
+                WorkspaceProjectRow(host: host, project: project, expanded: expandedBinding(project.id),
+                                    onOpenThread: { openThread($0) },
+                                    onNewThread: { newSessionLocation = WorkspaceLocation(host: host, project: project) })
             }
             if host.projects.isEmpty {
                 Text("No projects yet.").font(.subheadline).foregroundStyle(ZLTheme.muted)
@@ -123,6 +130,14 @@ struct WorkspacesView: View {
         }
     }
 
+    /// After the new-session sheet closes, hand the thread to the Sessions stack and close Workspaces.
+    private func openCreatedThread() {
+        guard let id = createdThreadID else { return }
+        createdThreadID = nil
+        openedThreadID = id
+        dismiss()
+    }
+
     private func browseAddedHost() {
         guard let id = addedHostID else { return }
         addedHostID = nil
@@ -160,6 +175,7 @@ private struct WorkspaceProjectRow: View {
     let project: WorkspaceProject
     @Binding var expanded: Bool
     let onOpenThread: (WorkspaceHistoryThread) -> Void
+    let onNewThread: () -> Void
 
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
@@ -184,6 +200,20 @@ private struct WorkspaceProjectRow: View {
             }
             Spacer(minLength: 8)
             openButton
+            newThreadButton
+        }
+    }
+
+    /// Opens the workspace first when it is closed, then creates a thread with the chosen agent.
+    @ViewBuilder private var newThreadButton: some View {
+        if session.capabilities.contains("thread.create") && (project.open || session.capabilities.contains("workspace.open")) {
+            Button { onNewThread() } label: {
+                Image(systemName: "plus").font(.body.weight(.semibold)).frame(width: 44, height: 44)
+            }
+            .buttonStyle(.borderless)
+            .disabled(session.workspaceProgress != nil || session.creatingThread)
+            .accessibilityLabel("New session in \(project.name)")
+            .accessibilityIdentifier("workspace-new-thread-" + project.id)
         }
     }
 

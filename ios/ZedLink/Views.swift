@@ -4,6 +4,8 @@ import CoreText
 import UIKit
 import VisionKit
 import PhotosUI
+import UniformTypeIdentifiers
+import Combine
 
 struct SessionsView: View {
     @EnvironmentObject private var session: SessionManager
@@ -13,6 +15,7 @@ struct SessionsView: View {
     @State private var showingNewSession = false
     @State private var showingWorkspaces = false
     @State private var workspaceThreadID: String?
+    @State private var createdThreadID: String?
     @Binding var navigationPath: [String]
     private let groups = ["Needs attention", "Running", "Ready & other"]
     private func key(_ thread: NativeThread) -> String {
@@ -20,6 +23,7 @@ struct SessionsView: View {
     }
     private var visibleThreads: [NativeThread] {
         session.visibleThreads.filter { thread in
+            guard session.matchesWorkspaceFilter(thread) else { return false }
             let activity = SessionActivity(thread)
             return (search.isEmpty || thread.searchText.localizedCaseInsensitiveContains(search)) &&
                 (filter == "All" || filter == "Needs attention" && activity.attention || filter == "Running" && activity.running || filter == "Pinned" && library.pins.contains(key(thread)))
@@ -32,7 +36,7 @@ struct SessionsView: View {
     private var recentThreads: [NativeThread] {
         guard search.isEmpty, filter == "All", session.state == .live else { return [] }
         return library.recent.compactMap { recentKey in
-            session.threads.first { key($0) == recentKey }
+            session.threads.first { key($0) == recentKey && session.matchesWorkspaceFilter($0) }
         }.prefix(3).map { $0 }
     }
     var body: some View {
@@ -47,6 +51,13 @@ struct SessionsView: View {
     private func openWorkspaceThread() {
         guard let thread = workspaceThreadID else { return }
         workspaceThreadID = nil
+        dismissZedLinkKeyboard()
+        navigationPath = [thread]
+    }
+
+    private func openCreatedThread() {
+        guard let thread = createdThreadID else { return }
+        createdThreadID = nil
         dismissZedLinkKeyboard()
         navigationPath = [thread]
     }
@@ -70,7 +81,9 @@ struct SessionsView: View {
             .onSubmit(of: .search) { dismissZedLinkKeyboard() }
             .toolbar(.visible, for: .navigationBar).navigationTitle("Sessions").navigationBarTitleDisplayMode(.inline)
             .toolbar { sessionsToolbar }
-            .sheet(isPresented: $showingNewSession) { NewSessionView() }
+            .sheet(isPresented: $showingNewSession, onDismiss: { openCreatedThread() }) {
+                NewSessionView(workspace: session.filteredWorkspaceLocation) { createdThreadID = $0 }
+            }
             .navigationDestination(for: String.self) { ConversationView(threadID: $0) }
             .onChange(of: session.threads, initial: true) { _, threads in
                 library.observe(threads, profile: session.profile?.gatewayID ?? "", target: session.targetID ?? "", selected: session.selectedThreadID)
@@ -78,8 +91,9 @@ struct SessionsView: View {
             .onChange(of: session.notificationThreadID) { _, thread in
                 if let thread { dismissZedLinkKeyboard(); navigationPath = [thread]; session.notificationThreadID = nil }
             }
-            .task(id: session.supportsRecentHistory && session.state == .live) {
-                while !Task.isCancelled && session.supportsRecentHistory && session.state == .live {
+            .task(id: session.supportsWorkspaces && session.state == .live) {
+                // The header breadcrumb and the "Recent in Zed" list both read workspace.list.
+                while !Task.isCancelled && session.supportsWorkspaces && session.state == .live {
                     await session.loadWorkspaces()
                     try? await Task.sleep(for: .seconds(30))
                 }
@@ -113,6 +127,15 @@ struct SessionsView: View {
     @ViewBuilder private var sessionNotices: some View {
         if session.demoPreview { Text("DEMO PREVIEW · Sample sessions, no live connection").font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16).padding(.vertical, 8) }
         if !session.issue.isEmpty { SessionIssueBanner() }
+        if let progress = session.workspaceProgress {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(progress).font(.caption).foregroundStyle(ZLTheme.muted)
+            }.padding(.horizontal, 16).padding(.vertical, 8)
+        } else if session.workspaceFilter != nil && !session.workspaceIssue.isEmpty {
+            Text(session.workspaceIssue).font(.caption).foregroundStyle(ZLTheme.warning)
+                .padding(.horizontal, 16).padding(.vertical, 8)
+        }
         if hasSavedOnlySessions {
             Text(savedSessionsText)
                 .font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16).padding(.vertical, 8)
@@ -127,7 +150,7 @@ struct SessionsView: View {
     private var historyThreads: [RecentHistoryThread] {
         guard session.state == .live, session.supportsRecentHistory, filter == "All" || filter == "Recent" else { return [] }
         let listed = Set(session.visibleThreads.map(\.id))
-        let matching = RecentHistoryThread.recent(in: session.workspaceHosts).filter { item in
+        let matching = RecentHistoryThread.recent(in: session.filteredWorkspaceHosts).filter { item in
             !listed.contains(item.id) && (search.isEmpty || item.searchText.localizedCaseInsensitiveContains(search))
         }
         return Array(matching.prefix(filter == "Recent" ? 30 : 8))
@@ -136,11 +159,8 @@ struct SessionsView: View {
     @ViewBuilder private var historySection: some View {
         if !historyThreads.isEmpty {
             SectionLabel("Recent in Zed").padding(.horizontal, 16).padding(.top, 18).padding(.bottom, 6)
-            if !session.workspaceIssue.isEmpty {
+            if session.workspaceFilter == nil && !session.workspaceIssue.isEmpty {
                 Text(session.workspaceIssue).font(.caption).foregroundStyle(ZLTheme.warning).padding(.horizontal, 16)
-            }
-            if let progress = session.workspaceProgress {
-                Text(progress).font(.caption).foregroundStyle(ZLTheme.muted).padding(.horizontal, 16)
             }
             ForEach(historyThreads) { item in
                 Button { openHistory(item.thread) } label: {
@@ -216,12 +236,18 @@ struct SessionsView: View {
 
     private var emptyTitle: String {
         if session.profile == nil { return "Choose a connection" }
+        if let filter = session.workspaceFilter, search.isEmpty {
+            return "No sessions in " + (filter.projectName ?? filter.hostLabel)
+        }
         if !session.visibleThreads.isEmpty { return "No matching sessions" }
         return session.state == .live ? "No exposed sessions" : "Sessions unavailable"
     }
 
     private var emptyDetail: String {
         if session.profile == nil { return "Pair a private gateway in Connections." }
+        if session.workspaceFilter != nil && search.isEmpty {
+            return "Create a session with +, or choose All workspaces in the header."
+        }
         if !session.visibleThreads.isEmpty { return "Try another search or filter." }
         return session.state == .live
             ? "Expose a conversation with /remote-control in desktop Zed, or create a session using +."
@@ -241,6 +267,9 @@ struct SessionsView: View {
                         .buttonStyle(.bordered).disabled(session.state == .connecting || session.state == .reconnecting)
                 } else if session.visibleThreads.isEmpty && session.capabilities.contains("thread.create") {
                     Button("Create Agent session") { showingNewSession = true }
+                        .buttonStyle(.bordered)
+                } else if session.workspaceFilter != nil {
+                    Button("Show all workspaces") { session.setWorkspaceFilter(nil) }
                         .buttonStyle(.bordered)
                 }
             }.padding(20)
@@ -299,38 +328,29 @@ struct SessionsView: View {
     }
     private var connectionHeader: some View {
         HStack(spacing: 8) {
-            Menu {
-                if let profile = session.profile {
-                    Text(profile.name); Text(profile.endpoint)
-                    ForEach(session.targets) { target in
-                        Button(target.label + (target.available ? "" : " · unavailable")) { Task { await session.selectTarget(target.id) } }
-                            .disabled(!target.available || session.demoPreview)
-                    }
-                }
-                Button("Manage connections") { session.showConnections = true }
-            } label: {
-                HStack(spacing: 5) {
-                    Text(session.profile?.name ?? "Choose a connection").lineLimit(1)
-                    Image(systemName: "chevron.right").font(.caption2)
-                    Text(session.targets.first(where: { $0.id == session.targetID })?.label ?? "Workspace").lineLimit(1)
-                    Image(systemName: "chevron.down").font(.caption2)
-                }.font(.caption).frame(minHeight: 44).foregroundStyle(ZLTheme.ink)
-            }.accessibilityIdentifier("zed-target-picker")
+            WorkspaceBreadcrumbMenu()
             Spacer(minLength: 0)
             if !session.demoPreview { ConnectionStatusView(state: session.state) }
         }.padding(.horizontal, 16).background(ZLTheme.surface)
     }
 }
 
-private struct NewSessionView: View {
+/// New-thread sheet. With `workspace`, the thread is created in that workspace (opening it in
+/// Zed first when closed). `onCreated` receives the new thread id before the sheet dismisses.
+struct NewSessionView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var session: SessionManager
+    var workspace: WorkspaceLocation? = nil
+    var contextPaths: [String] = []
+    var onCreated: ((String) -> Void)? = nil
     @State private var title = ""
     @State private var agentID = "zed-agent"
+    @State private var creating = false
 
     var body: some View {
         NavigationStack {
             Form {
+                SessionIssueBanner()
                 Section("Session") {
                     TextField("Optional title", text: $title)
                     Picker("Agent", selection: $agentID) {
@@ -339,6 +359,7 @@ private struct NewSessionView: View {
                         }
                     }
                 }
+                workspaceSection
                 Section {
                     Text("The selected agent, model, tools, permissions, and project remain configured in desktop Zed.")
                         .font(.footnote).foregroundStyle(ZLTheme.muted)
@@ -348,9 +369,8 @@ private struct NewSessionView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(session.creatingThread ? "Creating…" : "Create") {
-                        Task { if await session.createThread(title: title, agentID: agentID) { dismiss() } }
-                    }.disabled(session.creatingThread || session.createAgents.isEmpty)
+                    Button(creating ? "Creating…" : "Create") { create() }
+                        .disabled(creating || session.creatingThread || session.workspaceProgress != nil || session.createAgents.isEmpty)
                 }
             }
             .task {
@@ -359,6 +379,38 @@ private struct NewSessionView: View {
                     agentID = session.createAgents.first?.id ?? "zed-agent"
                 }
             }
+        }
+    }
+
+    @ViewBuilder private var workspaceSection: some View {
+        if let workspace {
+            Section {
+                LabeledContent("Workspace", value: workspace.project.name)
+                LabeledContent("Host", value: workspace.host.label)
+                if !contextPaths.isEmpty {
+                    LabeledContent("Attached", value: contextPaths.joined(separator: ", "))
+                }
+                if let progress = session.workspaceProgress {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(progress).font(.caption)
+                    }
+                } else if !workspace.project.open {
+                    Text("This workspace is closed. Zed opens it before creating the session.")
+                        .font(.caption).foregroundStyle(ZLTheme.muted)
+                }
+            }
+        }
+    }
+
+    private func create() {
+        creating = true
+        Task {
+            let id: String? = await session.createThread(title: title, agentID: agentID, workspace: workspace, contextPaths: contextPaths)
+            creating = false
+            guard let id else { return }
+            onCreated?(id)
+            dismiss()
         }
     }
 }
@@ -435,6 +487,9 @@ private struct SessionRow: View {
     @State private var proposedTitle = ""
     @State private var rewindPoint: NativeRewindPoint?
     @State private var composerPhoto: PhotosPickerItem?
+    @State private var showingPhotoPicker = false
+    @State private var showingFileImporter = false
+    @State private var clipboardHasImage = false
     @State private var cachedVisibleCount = 24
     @State private var imageToReview: UIImage?
     @State private var editingAttachmentID: UUID?
@@ -453,7 +508,7 @@ private struct SessionRow: View {
     }
 
     var body: some View {
-        withDialogs(withInputSheets(withSheets(withLifecycle(conversationContent))))
+        withDialogs(withInputSheets(withSheets(withAttachmentInputs(withLifecycle(conversationContent)))))
     }
 
     // `body` is split into these pieces because Swift 6.1 cannot type-check it as one expression in time.
@@ -580,6 +635,21 @@ private struct SessionRow: View {
                 imageToReview = image
             } catch { if scope == session.operationScope { session.reportIssue("Image unavailable: " + error.localizedDescription) } }
             self.composerPhoto = nil
+        }
+    }
+
+    private func withAttachmentInputs<Content: View>(_ content: Content) -> some View {
+        content
+        .photosPicker(isPresented: $showingPhotoPicker, selection: $composerPhoto, matching: .images)
+        .fileImporter(isPresented: $showingFileImporter, allowedContentTypes: [.item]) { result in
+            importPromptFile(result)
+        }
+        .onAppear { clipboardHasImage = UIPasteboard.general.hasImages }
+        .onReceive(NotificationCenter.default.publisher(for: UIPasteboard.changedNotification)) { _ in
+            clipboardHasImage = UIPasteboard.general.hasImages
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            clipboardHasImage = UIPasteboard.general.hasImages
         }
     }
 
@@ -797,10 +867,10 @@ private struct SessionRow: View {
             if session.state != .live { ConnectionStatusView(state: session.state) }
             if session.state == .live && !session.controlsIssue.isEmpty {
                 Button { Task { await session.refreshSessionControls() } } label: {
-                    Label("Controls need refresh", systemImage: "exclamationmark.circle")
-                        .font(.caption2).foregroundStyle(ZLTheme.warning)
+                    Label("Some controls didn't load · Retry", systemImage: "arrow.clockwise")
+                        .font(.caption2).foregroundStyle(ZLTheme.muted)
                 }
-                .accessibilityHint("Retries loading session controls; the conversation is live")
+                .accessibilityHint("Retries loading approvals, queue and agent settings; the conversation is live")
             }
             if let snapshot = session.snapshot, snapshot.threadID == threadID, snapshot.isBusy {
                 agentProgress
@@ -843,7 +913,7 @@ private struct SessionRow: View {
         Menu {
             Text("Connection: \(session.state.label)")
             if session.state == .live && !session.controlsIssue.isEmpty {
-                Text("Session controls: \(session.controlsIssue)")
+                Text("Some session controls didn't load (\(session.controlsIssue)). The conversation is live.")
                 Button("Retry session controls", systemImage: "arrow.clockwise") {
                     Task { await session.refreshSessionControls() }
                 }
@@ -855,6 +925,11 @@ private struct SessionRow: View {
             }.disabled(session.profile == nil)
             Button("Agent history", systemImage: "person.2") { composerFocused = false; showingAgentHistory = true }
             Button("Agent settings", systemImage: "slider.horizontal.3") { composerFocused = false; showingModelControls = true }
+            Button("New session", systemImage: "plus.bubble") {
+                composerFocused = false
+                Task { await session.createSiblingThread(of: threadID) }
+            }.disabled(session.state != .live || !session.capabilities.contains("thread.create") || session.creatingThread || session.workspaceProgress != nil || !isExposed)
+                .accessibilityIdentifier("new-sibling-session")
             Button("Draft delegated task", systemImage: "arrow.triangle.branch") {
                 if session.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     session.prepareSubagentTask(); composerFocused = true
@@ -1135,7 +1210,8 @@ private struct SessionRow: View {
             if session.state == .live, session.selectedThreadID == threadID,
                let settings = session.threadSettings {
                 let agent = session.threads.first { $0.id == threadID }?.agentName ?? "Zed Agent"
-                let model = settings.models.first { $0.id == "\(settings.providerID ?? "")\n\(settings.modelID ?? "")" }?.name ?? settings.modelID
+                let selectedModel = settings.models.first { $0.id == "\(settings.providerID ?? "")\n\(settings.modelID ?? "")" }?.name ?? settings.modelID
+                let model: String? = selectedModel ?? (settings.managedByAgent ? "Managed by the agent" : nil)
                 Button { showingModelControls = true } label: {
                     Label(agent + (model.map { " · \($0)" } ?? ""), systemImage: "slider.horizontal.3")
                         .font(.caption).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
@@ -1147,9 +1223,11 @@ private struct SessionRow: View {
                     HStack {
                         ForEach(session.attachments) { image in
                             Menu {
-                                Button("Annotate") { editingAttachmentID = image.id; imageToReview = UIImage(data: image.data) }
+                                if image.isImage {
+                                    Button("Annotate") { editingAttachmentID = image.id; imageToReview = UIImage(data: image.data) }
+                                }
                                 Button("Remove", role: .destructive) { session.attachments.removeAll { $0.id == image.id } }
-                            } label: { Label(image.name, systemImage: "photo") }
+                            } label: { Label(image.name, systemImage: image.isImage ? "photo" : "doc.text") }
                         }
                         ForEach(Array(session.contextPaths).sorted(), id: \.self) { path in
                             Button { session.contextPaths.remove(path) } label: { Label(path, systemImage: "xmark.circle") }
@@ -1168,22 +1246,25 @@ private struct SessionRow: View {
                     if let composerScope { composerLibrary.recordChoice(command.name, in: composerScope) }
                 }.task { await session.refreshCommands() }
             }
+            clipboardImageRow
             VStack(alignment: .leading, spacing: 0) {
                 composerTextField.frame(maxWidth: .infinity, alignment: .leading)
                 HStack(spacing: 8) {
                     Menu {
                         Section("Add to message") {
-                            PhotosPicker(selection: $composerPhoto, matching: .images) {
-                                Label("Add image", systemImage: "photo.badge.plus")
+                            // A PhotosPicker inside a Menu never presents; the menu item raises a flag instead.
+                            Button("Add image", systemImage: "photo.badge.plus") {
+                                composerFocused = false; showingPhotoPicker = true
                             }
                             .disabled(!session.capabilities.contains("thread.attachments") || session.supportsImages == false)
-                            Button("Paste image from phone", systemImage: "doc.on.clipboard") {
-                                guard let image = UIPasteboard.general.image else {
-                                    session.reportIssue("Clipboard does not contain a supported image."); return
-                                }
-                                imageToReview = image
-                            }
+                            .accessibilityIdentifier("composer-add-image")
+                            Button("Paste image from phone", systemImage: "doc.on.clipboard") { pasteImageFromPhone() }
                             .disabled(!session.capabilities.contains("thread.attachments") || session.supportsImages == false)
+                            Button("File…", systemImage: "doc.badge.plus") {
+                                composerFocused = false; showingFileImporter = true
+                            }
+                            .disabled(!session.capabilities.contains("thread.attachments"))
+                            .accessibilityIdentifier("composer-add-file")
                             Button("Paste text from phone", systemImage: "text.alignleft") {
                                 _ = appendToDraft(UIPasteboard.general.string ?? "")
                             }
@@ -1232,6 +1313,51 @@ private struct SessionRow: View {
         .padding(.horizontal, 10).padding(.top, 6).padding(.bottom, 6)
         .background(ZLTheme.background)
         .overlay(alignment: .top) { Hairline() }
+    }
+
+    /// System paste control, shown while the phone clipboard holds an image. It pastes without the
+    /// "Allow Paste" prompt because the user taps the system button directly.
+    @ViewBuilder private var clipboardImageRow: some View {
+        if clipboardHasImage && session.capabilities.contains("thread.attachments") && session.supportsImages != false
+            && session.state == .live && session.selectedThreadID == threadID {
+            HStack(spacing: 8) {
+                Label("Image on clipboard", systemImage: "photo.on.rectangle").font(.caption).foregroundStyle(ZLTheme.muted)
+                Spacer(minLength: 0)
+                PasteButton(supportedContentTypes: [.image]) { providers in
+                    Task { @MainActor in
+                        if let image = await loadPromptImage(from: providers) { imageToReview = image }
+                        else { session.reportIssue("Clipboard does not contain a supported image.") }
+                    }
+                }
+                .labelStyle(.titleAndIcon).buttonBorderShape(.capsule).controlSize(.small)
+                Button { clipboardHasImage = false } label: {
+                    Image(systemName: "xmark").font(.caption).frame(width: 32, height: 32)
+                }.buttonStyle(.plain).accessibilityLabel("Hide clipboard image suggestion")
+            }.padding(.horizontal, 12)
+        }
+    }
+
+    private func pasteImageFromPhone() {
+        let scope = session.operationScope
+        Task { @MainActor in
+            let image: UIImage? = await loadPhoneClipboardImage()
+            guard scope == session.operationScope else { return }
+            if let image { imageToReview = image }
+            else { session.reportIssue("Clipboard does not contain a supported image (PNG, JPEG, HEIC or WebP).") }
+        }
+    }
+
+    private func importPromptFile(_ result: Result<URL, Error>) {
+        switch result {
+        case .failure(let error):
+            session.reportIssue("File unavailable: " + error.localizedDescription)
+        case .success(let url):
+            switch readPromptFile(url) {
+            case .image(let image): imageToReview = image
+            case .text(let name, let mimeType, let data): session.addTextFile(name: name, mimeType: mimeType, data: data)
+            case .failure(let message): session.reportIssue(message)
+            }
+        }
     }
 
     private var composerTextField: some View {

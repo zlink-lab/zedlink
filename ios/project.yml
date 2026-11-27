@@ -26,7 +26,8 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: ZedLink
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_NSMicrophoneUsageDescription: Dictate a draft message or terminal input. Nothing is sent until you choose Send.
-        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Convert your voice into editable draft text using on-device recognition.
+        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Convert your voice into editable draft text. Recognition runs on the iPhone when the chosen language supports it; otherwise Apple speech recognition processes the audio.
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: Choose a photo to attach to a message. Nothing is sent until you choose Send.
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connect to your paired ZedLink gateway on your private network.
         INFOPLIST_KEY_NSCameraUsageDescription: Scan the ZedLink pairing QR shown on your workstation.
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES

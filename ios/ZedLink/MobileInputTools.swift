@@ -2,6 +2,33 @@ import SwiftUI
 import Speech
 import AVFoundation
 import UIKit
+import UniformTypeIdentifiers
+
+/// Dictation language stored under `zedlink.speechLocale`: "system", "ru-RU" or "en-US".
+struct DictationLanguageOption: Identifiable, Equatable {
+    let id: String
+    let label: String
+}
+
+enum DictationLanguage {
+    static let storageKey = "zedlink.speechLocale"
+    static let options: [DictationLanguageOption] = [
+        DictationLanguageOption(id: "system", label: "System"),
+        DictationLanguageOption(id: "ru-RU", label: "Русский"),
+        DictationLanguageOption(id: "en-US", label: "English (US)"),
+    ]
+
+    static var selected: String { UserDefaults.standard.string(forKey: storageKey) ?? "system" }
+
+    static func label(_ id: String) -> String {
+        options.first(where: { $0.id == id })?.label ?? id
+    }
+
+    static func recognizer() -> SFSpeechRecognizer? {
+        let id: String = selected
+        return id == "system" ? SFSpeechRecognizer() : SFSpeechRecognizer(locale: Locale(identifier: id))
+    }
+}
 
 @MainActor
 private final class DraftDictation: ObservableObject {
@@ -13,6 +40,7 @@ private final class DraftDictation: ObservableObject {
     private let engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+    private var recognizer: SFSpeechRecognizer?
     private var tapped = false
     private var generation = UUID()
     private var finishTimeout: Task<Void, Never>?
@@ -33,9 +61,16 @@ private final class DraftDictation: ObservableObject {
         }
         guard current == generation else { return }
         guard authorization == .authorized, microphone else { issue = "Allow microphone and speech access in Settings, or use keyboard dictation."; return }
-        guard let recognizer = SFSpeechRecognizer(), recognizer.isAvailable, recognizer.supportsOnDeviceRecognition else {
-            issue = "On-device dictation is unavailable for this language. Use your keyboard microphone."; return
+        guard let recognizer = DictationLanguage.recognizer() else {
+            issue = "Dictation does not support \(DictationLanguage.label(DictationLanguage.selected)). Choose another language in Settings or use your keyboard microphone."; return
         }
+        guard recognizer.isAvailable else {
+            issue = recognizer.supportsOnDeviceRecognition
+                ? "Dictation is temporarily unavailable. Try again or use your keyboard microphone."
+                : "Dictation for this language needs Apple's speech service. Check the network connection or use your keyboard microphone."
+            return
+        }
+        self.recognizer = recognizer
         transcript = ""; issue = ""
         do {
             let audio = AVAudioSession.sharedInstance()
@@ -43,7 +78,8 @@ private final class DraftDictation: ObservableObject {
             try audio.setActive(true)
             audioActive = true
             let request = SFSpeechAudioBufferRecognitionRequest()
-            request.requiresOnDeviceRecognition = true
+            // Prefer on-device recognition; otherwise Apple's speech service transcribes the audio.
+            request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
             request.shouldReportPartialResults = true
             self.request = request
             let node = engine.inputNode
@@ -82,7 +118,7 @@ private final class DraftDictation: ObservableObject {
         generation = UUID()
         finishTimeout?.cancel(); finishTimeout = nil
         stopAudioCapture()
-        request?.endAudio(); task?.cancel(); task = nil; request = nil
+        request?.endAudio(); task?.cancel(); task = nil; request = nil; recognizer = nil
         listening = false; starting = false; finishing = false
         if audioActive {
             audioActive = false
@@ -168,4 +204,91 @@ struct RemoteClipboardView: View {
         busy = true
         Task { defer { busy = false }; if let result = await session.transferClipboard(value) { text = result; status = value == nil ? "Ready to review." : "Desktop clipboard updated." } else { status = session.issue } }
     }
+}
+
+// MARK: Prompt attachments from the phone (clipboard and Files)
+
+/// Reads the phone clipboard image: `UIPasteboard.image` first, then any item provider whose
+/// type conforms to `public.image` (PNG, JPEG, HEIC, WebP, …).
+@MainActor func loadPhoneClipboardImage() async -> UIImage? {
+    let pasteboard = UIPasteboard.general
+    if let image = pasteboard.image { return image }
+    return await loadPromptImage(from: pasteboard.itemProviders)
+}
+
+@MainActor func loadPromptImage(from providers: [NSItemProvider]) async -> UIImage? {
+    for provider in providers {
+        let types: [String] = provider.registeredTypeIdentifiers.filter { identifier in
+            UTType(identifier)?.conforms(to: .image) == true
+        }
+        for type in types {
+            let data: Data? = await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
+                _ = provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
+                    continuation.resume(returning: data)
+                }
+            }
+            if let data, let image = UIImage(data: data) { return image }
+        }
+        if provider.canLoadObject(ofClass: UIImage.self) {
+            let image: UIImage? = await withCheckedContinuation { (continuation: CheckedContinuation<UIImage?, Never>) in
+                _ = provider.loadObject(ofClass: UIImage.self) { object, _ in
+                    continuation.resume(returning: object as? UIImage)
+                }
+            }
+            if let image { return image }
+        }
+    }
+    return nil
+}
+
+enum PromptFileImport {
+    case image(UIImage)
+    case text(name: String, mimeType: String, data: Data)
+    case failure(String)
+}
+
+/// The bridge accepts PNG/JPEG/WebP images and UTF-8 `text/*`, JSON and XML uploads up to
+/// 256 KiB (embedded as text resources). Images go through annotation and JPEG conversion.
+func readPromptFile(_ url: URL) -> PromptFileImport {
+    let scoped: Bool = url.startAccessingSecurityScopedResource()
+    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+    let values: URLResourceValues? = try? url.resourceValues(forKeys: [.contentTypeKey, .fileSizeKey, .isDirectoryKey])
+    if values?.isDirectory == true { return .failure("Choose a file, not a folder.") }
+    let type: UTType? = values?.contentType ?? UTType(filenameExtension: url.pathExtension)
+    let size: Int = values?.fileSize ?? 0
+    let textLimit: Int = 256 * 1024
+    if type?.conforms(to: .image) == true {
+        guard size <= 25 * 1024 * 1024 else { return .failure("This image is too large to attach.") }
+        guard let data = try? Data(contentsOf: url), let image = UIImage(data: data) else {
+            return .failure("This image format cannot be read on the phone.")
+        }
+        return .image(image)
+    }
+    let unsupported: String = "Only images and UTF-8 text files up to 256 KiB can be attached from the phone. Attach other files from the project in desktop Zed."
+    guard size <= textLimit, let data = try? Data(contentsOf: url), data.count <= textLimit else { return .failure(unsupported) }
+    guard !data.isEmpty, !data.contains(0), String(data: data, encoding: .utf8) != nil else { return .failure(unsupported) }
+    let mimeType: String
+    if type?.conforms(to: .json) == true {
+        mimeType = "application/json"
+    } else if type?.conforms(to: .xml) == true {
+        mimeType = "application/xml"
+    } else if let preferred = type?.preferredMIMEType, preferred.hasPrefix("text/"), preferred.utf8.count <= 128 {
+        mimeType = preferred
+    } else {
+        mimeType = "text/plain"
+    }
+    return .text(name: promptFileName(url.lastPathComponent), mimeType: mimeType, data: data)
+}
+
+/// A bare file name the bridge accepts: no separators or control characters, no leading dot, at most 128 bytes.
+func promptFileName(_ raw: String) -> String {
+    let blocked: Set<Unicode.Scalar> = ["/", "\\"]
+    let scalars: String.UnicodeScalarView = raw.unicodeScalars.filter { (scalar: Unicode.Scalar) -> Bool in
+        scalar.value >= 32 && scalar.value != 127 && !blocked.contains(scalar)
+    }
+    var name: String = String(scalars)
+    while name.hasPrefix(".") { name.removeFirst() }
+    while name.utf8.count > 120 { name.removeFirst() }
+    while name.hasPrefix(".") { name.removeFirst() }
+    return name.trimmingCharacters(in: .whitespaces).isEmpty ? "attachment.txt" : name
 }

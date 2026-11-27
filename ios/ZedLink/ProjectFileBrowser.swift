@@ -1,7 +1,9 @@
 import SwiftUI
+import UIKit
 
 struct ProjectFileBrowser: View {
     @EnvironmentObject private var session: SessionManager
+    @Environment(\.dismiss) private var dismiss
     @State private var directory = ""
     @State private var query = ""
     @State private var reading = false
@@ -26,9 +28,11 @@ struct ProjectFileBrowser: View {
         Group {
             if reading {
                 VStack(alignment: .leading, spacing: 0) {
-                    HStack {
+                    HStack(spacing: 12) {
                         Button { reading = false } label: { Label("Files", systemImage: "chevron.left") }
                         Spacer()
+                        previewAttachButton
+                        previewFileMenu
                         ShareLink(item: session.previewContent) { Image(systemName: "square.and.arrow.up") }
                             .disabled(session.previewLoading)
                     }.padding()
@@ -37,11 +41,7 @@ struct ProjectFileBrowser: View {
                     } else {
                         CodeReviewView(content: session.previewContent, title: session.previewTitle, truncated: session.previewTruncated, initialLine: selectedLine)
                         Text(session.previewTruncated ? "Partial preview · 256 KiB limit · Cannot attach" : "Read-only project file")
-                            .font(.caption).foregroundStyle(.secondary).padding(.horizontal)
-                        Button(session.contextPaths.contains(session.previewTitle) ? "Attached" : "Attach to prompt") {
-                            session.contextPaths.insert(session.previewTitle)
-                        }.disabled(!session.previewReadable || session.previewLoading || session.previewTruncated || session.contextPaths.contains(session.previewTitle))
-                            .padding()
+                            .font(.caption).foregroundStyle(.secondary).padding(.horizontal).padding(.bottom, 8)
                     }
                 }
                 .navigationTitle(session.previewTitle.split(separator: "/").last.map(String.init) ?? "File")
@@ -95,6 +95,7 @@ struct ProjectFileBrowser: View {
                                     if entry.kind == "directory" { Image(systemName: "chevron.right").foregroundStyle(.secondary) }
                                 }.padding(.vertical, 4)
                             }
+                            .contextMenu { fileActions(entry.id, isDirectory: entry.kind == "directory") }
                         }
                         if entries.isEmpty { Text("No readable files in this folder or filter.").foregroundStyle(.secondary) }
                     }
@@ -109,6 +110,56 @@ struct ProjectFileBrowser: View {
             .task(id: directory) { await session.loadDirectory(directory) }
             .onDisappear { searchTask?.cancel() }
             .onChange(of: session.operationScope) { _, _ in searchTask?.cancel(); matches = []; searchStatus = ""; reading = false }
+    }
+
+    private var previewAttachable: Bool {
+        session.previewReadable && !session.previewLoading && !session.previewTruncated
+    }
+
+    private var previewAttachButton: some View {
+        let attached: Bool = session.contextPaths.contains(session.previewTitle)
+        return Button { session.addContextPath(session.previewTitle) } label: {
+            Label(attached ? "Attached" : "Attach to prompt", systemImage: attached ? "checkmark" : "paperclip")
+                .font(.subheadline.weight(.semibold))
+        }
+        .buttonStyle(.borderedProminent).controlSize(.small)
+        .disabled(!previewAttachable || attached)
+        .accessibilityIdentifier("attach-preview-to-prompt")
+    }
+
+    private var previewFileMenu: some View {
+        Menu {
+            fileActions(session.previewTitle, isDirectory: false)
+        } label: {
+            Image(systemName: "ellipsis.circle").frame(minWidth: 32, minHeight: 32)
+        }
+        .disabled(session.previewTitle.isEmpty)
+        .accessibilityLabel("File actions")
+    }
+
+    private var canStartPrompt: Bool {
+        session.state == .live && session.capabilities.contains("thread.create") && session.selectedThreadID != nil
+            && !session.creatingThread && session.workspaceProgress == nil
+    }
+
+    /// Shared by the row context menu and the preview header.
+    @ViewBuilder private func fileActions(_ path: String, isDirectory: Bool) -> some View {
+        Button("Copy path", systemImage: "doc.on.doc") { UIPasteboard.general.string = path }
+        if !isDirectory {
+            Button("Add to prompt", systemImage: "paperclip") { session.addContextPath(path) }
+                .disabled(session.contextPaths.contains(path))
+            Button("New prompt with file", systemImage: "plus.bubble") { startPrompt(with: path) }
+                .disabled(!canStartPrompt)
+        }
+    }
+
+    /// New thread in this workspace with the same agent, the file attached as context, then opens it.
+    private func startPrompt(with path: String) {
+        guard let threadID = session.selectedThreadID else { return }
+        Task {
+            guard await session.createSiblingThread(of: threadID, contextPaths: [path]) != nil else { return }
+            dismiss()
+        }
     }
 
     private func searchContents() {

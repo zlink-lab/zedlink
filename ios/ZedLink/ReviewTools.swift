@@ -212,64 +212,160 @@ struct SessionModelControls: View {
             Form {
                 SessionIssueBanner()
                 if let settings = session.threadSettings {
-                    if !settings.profiles.isEmpty {
-                        Section("Agent profile") {
-                            ForEach(settings.profiles) { profile in
-                                Button { Task { await session.updateAgentSettings(profileID: profile.id) } } label: {
-                                    HStack { Text(profile.name); Spacer(); if profile.id == settings.profileID { Image(systemName: "checkmark") } }
-                                }.disabled(session.state != .live || session.snapshot?.status != "Idle" || session.updatingModel || !session.capabilities.contains("thread.settings.update"))
-                            }
-                        }
-                    }
-                    if settings.thinkingSupported, let enabled = settings.thinkingEnabled {
-                        Section("Thinking") {
-                            Toggle("Model thinking", isOn: Binding(get: { enabled }, set: { value in Task { await session.updateAgentSettings(thinking: value) } }))
-                                .disabled(session.state != .live || session.snapshot?.status != "Idle" || session.updatingModel || !settings.thinkingCanDisable || !session.capabilities.contains("thread.settings.update"))
-                            if !settings.thinkingCanDisable { Text("This model requires thinking.").font(.caption) }
-                        }
-                    }
-                    Section("Zed model") {
-                        if settings.models.isEmpty { Text("This Agent does not advertise a remote model selector. Configure it in desktop Zed.").font(.caption) }
-                        ForEach(settings.models) { model in
-                            Button { Task { await session.selectModel(model) } } label: {
-                                HStack {
-                                    VStack(alignment: .leading) { Text(model.name); Text(model.providerID).font(.caption).foregroundStyle(.secondary) }
-                                    Spacer()
-                                    if model.id == "\(settings.providerID ?? "")\n\(settings.modelID ?? "")" { Image(systemName: "checkmark") }
-                                }
-                            }.disabled(session.state != .live || session.snapshot?.status != "Idle" || session.updatingModel || !session.capabilities.contains("thread.settings.update"))
-                        }
-                    }
-                    Section("Context · last reported by Zed") {
-                        if let used = settings.usedTokens, let maximum = settings.maxTokens, maximum > 0 {
-                            LabeledContent("Used", value: "\(used.formatted()) / \(maximum.formatted()) tokens")
-                            ProgressView(value: min(Double(used) / Double(maximum), 1))
-                                .tint(Double(used) / Double(maximum) >= 0.8 ? ZLTheme.warning : ZLTheme.focus)
-                            if let input = settings.inputTokens {
-                                LabeledContent { Text("\(input.formatted()) tokens") } label: {
-                                    Label("Input", systemImage: "arrow.down")
-                                }
-                            }
-                            if let output = settings.outputTokens {
-                                LabeledContent { Text("\(output.formatted()) tokens") } label: {
-                                    Label("Output", systemImage: "arrow.up")
-                                }
-                            }
-                            if let remaining = settings.remainingTokens {
-                                LabeledContent("Remaining", value: "\(remaining.formatted()) tokens")
-                            }
-                            if Double(used) / Double(maximum) >= 0.8 {
-                                Text("Context is filling up. Check desktop Zed's compaction state before sending a long prompt.")
-                                    .font(.caption).foregroundStyle(ZLTheme.warning)
-                            }
-                        } else {
-                            Text("Zed has not reported context usage for this thread yet.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
+                    managedSection(settings)
+                    modesSection(settings)
+                    configOptionsSection(settings)
+                    profileSection(settings)
+                    thinkingSection(settings)
+                    modelSection(settings)
+                    contextSection(settings)
                 } else { Text("Model selection is not advertised by this Agent. Its configuration stays in desktop Zed.") }
             }.navigationTitle("Agent settings").navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
+        }
+    }
+
+    /// Controls are usable only while the native turn is idle (the bridge refuses busy threads).
+    private var controlsDisabled: Bool {
+        session.state != .live || session.snapshot?.status != "Idle" || session.updatingModel || !session.capabilities.contains("thread.settings.update")
+    }
+
+    private var agentName: String {
+        session.threads.first(where: { $0.id == session.selectedThreadID })?.agentName ?? "This agent"
+    }
+
+    @ViewBuilder private func managedSection(_ settings: NativeThreadSettings) -> some View {
+        if settings.managedByAgent {
+            Section {
+                Label("Managed by the agent", systemImage: "person.crop.circle.badge.checkmark")
+                    .font(.subheadline.weight(.semibold))
+                Text(settings.modes == nil && settings.configOptions.isEmpty && settings.models.isEmpty
+                     ? "\(agentName) keeps its own model and settings. Change them in desktop Zed or in the agent's configuration."
+                     : "\(agentName) keeps its own configuration. The options it shares with Zed are listed below.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private func modesSection(_ settings: NativeThreadSettings) -> some View {
+        if let modes = settings.modes {
+            Section("Mode") {
+                Picker("Mode", selection: Binding<String>(
+                    get: { modes.currentID ?? "" },
+                    set: { id in Task { await session.selectMode(id) } }
+                )) {
+                    ForEach(modes.available) { mode in
+                        Text(mode.name).tag(mode.id)
+                    }
+                }
+                .disabled(controlsDisabled)
+                .accessibilityIdentifier("thread-mode-picker")
+                if let current = modes.available.first(where: { $0.id == modes.currentID }), let detail = current.description {
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func configOptionsSection(_ settings: NativeThreadSettings) -> some View {
+        if !settings.configOptions.isEmpty {
+            Section("Agent options") {
+                ForEach(settings.configOptions) { option in
+                    configOptionPicker(option)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func configOptionPicker(_ option: NativeConfigOption) -> some View {
+        Picker(option.name, selection: Binding<String>(
+            get: { option.currentValue ?? "" },
+            set: { value in Task { await session.selectConfigOption(option, value: value) } }
+        )) {
+            ForEach(option.options) { choice in
+                Text(choice.name).tag(choice.value)
+            }
+        }
+        .disabled(controlsDisabled)
+        .accessibilityIdentifier("thread-config-" + option.id)
+        if let detail = option.description {
+            Text(detail).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private func profileSection(_ settings: NativeThreadSettings) -> some View {
+        if !settings.profiles.isEmpty {
+            Section("Agent profile") {
+                ForEach(settings.profiles) { profile in
+                    Button { Task { await session.updateAgentSettings(profileID: profile.id) } } label: {
+                        HStack { Text(profile.name); Spacer(); if profile.id == settings.profileID { Image(systemName: "checkmark") } }
+                    }.disabled(controlsDisabled || settings.managedByAgent)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func thinkingSection(_ settings: NativeThreadSettings) -> some View {
+        if settings.thinkingSupported, let enabled = settings.thinkingEnabled {
+            Section("Thinking") {
+                Toggle("Model thinking", isOn: Binding(get: { enabled }, set: { value in Task { await session.updateAgentSettings(thinking: value) } }))
+                    .disabled(controlsDisabled || !settings.thinkingCanDisable || settings.managedByAgent)
+                if !settings.thinkingCanDisable { Text("This model requires thinking.").font(.caption) }
+            }
+        }
+    }
+
+    private func isSelected(_ model: NativeModelOption, _ settings: NativeThreadSettings) -> Bool {
+        model.id == "\(settings.providerID ?? "")\n\(settings.modelID ?? "")"
+    }
+
+    @ViewBuilder private func modelSection(_ settings: NativeThreadSettings) -> some View {
+        if !settings.models.isEmpty || !settings.managedByAgent {
+            Section(settings.managedByAgent ? "Model" : "Zed model") {
+                if settings.models.isEmpty { Text("This Agent does not advertise a remote model selector. Configure it in desktop Zed.").font(.caption) }
+                ForEach(settings.models) { model in
+                    Button { Task { await session.selectModel(model) } } label: {
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(model.name)
+                                if model.providerID != "acp" { Text(model.providerID).font(.caption).foregroundStyle(.secondary) }
+                            }
+                            Spacer()
+                            if isSelected(model, settings) { Image(systemName: "checkmark") }
+                        }
+                    }.disabled(controlsDisabled || !settings.canSelectModels)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func contextSection(_ settings: NativeThreadSettings) -> some View {
+        Section("Context · last reported by Zed") {
+            if let used = settings.usedTokens, let maximum = settings.maxTokens, maximum > 0 {
+                LabeledContent("Used", value: "\(used.formatted()) / \(maximum.formatted()) tokens")
+                ProgressView(value: min(Double(used) / Double(maximum), 1))
+                    .tint(Double(used) / Double(maximum) >= 0.8 ? ZLTheme.warning : ZLTheme.focus)
+                if let input = settings.inputTokens {
+                    LabeledContent { Text("\(input.formatted()) tokens") } label: {
+                        Label("Input", systemImage: "arrow.down")
+                    }
+                }
+                if let output = settings.outputTokens {
+                    LabeledContent { Text("\(output.formatted()) tokens") } label: {
+                        Label("Output", systemImage: "arrow.up")
+                    }
+                }
+                if let remaining = settings.remainingTokens {
+                    LabeledContent("Remaining", value: "\(remaining.formatted()) tokens")
+                }
+                if Double(used) / Double(maximum) >= 0.8 {
+                    Text("Context is filling up. Check desktop Zed's compaction state before sending a long prompt.")
+                        .font(.caption).foregroundStyle(ZLTheme.warning)
+                }
+            } else {
+                Text(settings.managedByAgent ? "This agent has not reported context usage." : "Zed has not reported context usage for this thread yet.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 }

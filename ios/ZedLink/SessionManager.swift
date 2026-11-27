@@ -59,6 +59,8 @@ import Network
     @Published private(set) var workspaceLoaded = false
     @Published private(set) var workspaceProgress: String?
     @Published private(set) var workspaceIssue = ""
+    /// Breadcrumb filter for the sessions list; persisted per connection profile.
+    @Published private(set) var workspaceFilter: WorkspaceFilter?
     private var workspaceRequest = UUID()
     private var searchRequest = UUID()
     var operationScope: [String] { [generation.uuidString, profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? "", selectedThreadID ?? ""] }
@@ -68,6 +70,19 @@ import Network
         guard capabilities.contains("thread.attachments"), supportsImages != false else { issue = "This thread or model does not support image attachments."; return }
         guard attachments.count + contextPaths.count < 8, data.count <= 1024 * 1024 else { issue = "Use at most eight attachments, each image up to 1 MiB."; return }
         attachments.append(PromptAttachment(name: "image-\(attachments.count + 1).jpg", mimeType: "image/jpeg", data: data))
+    }
+    /// A text file from the phone. The bridge embeds `text/*`, JSON and XML uploads as text resources (256 KiB).
+    func addTextFile(name: String, mimeType: String, data: Data) {
+        guard capabilities.contains("thread.attachments") else { issue = "This Zed version does not accept attachments from the phone."; return }
+        guard attachments.count + contextPaths.count < 8 else { issue = "A prompt can include at most eight attachments."; return }
+        guard data.count <= 256 * 1024 else { issue = "Text files can be up to 256 KiB."; return }
+        attachments.append(PromptAttachment(name: name, mimeType: mimeType, data: data))
+    }
+    /// Adds a project file (project-relative path) to the next prompt.
+    func addContextPath(_ path: String) {
+        guard !contextPaths.contains(path) else { return }
+        guard attachments.count + contextPaths.count < 8 else { issue = "A prompt can include at most eight attachments."; return }
+        contextPaths.insert(path)
     }
     @Published private(set) var creatingThread = false
     @Published private(set) var selectedThreadID: String?
@@ -175,6 +190,7 @@ import Network
         issue = ""
         controlsIssue = ""
         notificationNeedsWorkspace = false
+        workspaceFilter = nil
     }
 
     func connect(_ nextProfile: ConnectionProfile, target requestedTargetID: String? = nil,
@@ -198,6 +214,8 @@ import Network
         if !sameProfile { draft = "" }
         let current = generation
         profile = nextProfile
+        workspaceFilter = UserDefaults.standard.data(forKey: workspaceFilterKey(nextProfile))
+            .flatMap { try? JSONDecoder().decode(WorkspaceFilter.self, from: $0) }
         state = .connecting
         resumeTrace = ResumeTrace()
         let savedTarget = UserDefaults.standard.string(forKey: targetKey(nextProfile))
@@ -633,25 +651,53 @@ import Network
         } catch { issue = error.localizedDescription }
     }
 
-    func createThread(title: String, agentID: String) async -> Bool {
-        guard capabilities.contains("thread.create"), let client, let instanceID, let epoch,
-              !creatingThread else { return false }
+    /// Creates a native thread and selects it. With `workspace`, a closed workspace is opened first
+    /// and its identity is sent as `host_id`/`project_id`/`workspace_paths` (older bridges ignore
+    /// these and create the thread in the target's project). `contextPaths` are attached to the draft.
+    func createThread(title: String, agentID: String, workspace: WorkspaceLocation? = nil,
+                      contextPaths initialPaths: [String] = []) async -> String? {
+        guard capabilities.contains("thread.create"), client != nil, instanceID != nil, epoch != nil,
+              !creatingThread else { return nil }
+        var location: WorkspaceLocation? = workspace
+        if let target = workspace, !target.project.open {
+            guard capabilities.contains("workspace.open") else {
+                issue = "Open \(target.project.name) in desktop Zed first."; return nil
+            }
+            guard await openWorkspace(host: target.host, paths: target.project.paths, name: target.project.name) else {
+                issue = workspaceIssue.isEmpty ? "Zed could not open \(target.project.name)." : workspaceIssue
+                return nil
+            }
+            if let opened = workspaceProject(hostID: target.host.id, paths: target.project.paths) {
+                let host: WorkspaceHost = workspaceHosts.first(where: { $0.id == target.host.id }) ?? target.host
+                location = WorkspaceLocation(host: host, project: opened)
+            }
+        }
+        guard let client, let instanceID, let epoch else { return nil }
         creatingThread = true
         defer { creatingThread = false }
         let requestID = UUID().uuidString
+        var params: [String: Any] = [
+            "instance_id": instanceID,
+            "epoch": epoch,
+            "title": title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? NSNull() : title.trimmingCharacters(in: .whitespacesAndNewlines),
+            "agent_id": agentID,
+        ]
+        if let location {
+            params["host_id"] = location.host.id
+            params["project_id"] = location.project.id
+            params["workspace_paths"] = location.project.paths
+        }
         do {
             for _ in 0..<40 {
-                let result = try await client.rpc("thread.create", params: [
-                    "instance_id": instanceID,
-                    "epoch": epoch,
-                    "title": title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? NSNull() : title.trimmingCharacters(in: .whitespacesAndNewlines),
-                    "agent_id": agentID,
-                ], requestID: requestID)
+                let result = try await client.rpc("thread.create", params: params, requestID: requestID)
                 if result["outcome"] as? String == "ready", let id = result["thread_id"] as? String {
                     try await loadThreads()
                     await select(id)
-                    return true
+                    if selectedThreadID == id {
+                        for path in initialPaths.prefix(8) { contextPaths.insert(path) }
+                    }
+                    return id
                 }
                 guard result["outcome"] as? String == "creating" else {
                     throw GatewayFailure.invalidResponse
@@ -661,8 +707,76 @@ import Network
             throw GatewayFailure.native("Zed is still creating the session. Refresh to check its status.")
         } catch {
             issue = error.localizedDescription
-            return false
+            return nil
         }
+    }
+
+    /// Opens a thread in the Sessions navigation stack (same path as notification taps).
+    func navigate(toThread id: String) { notificationThreadID = id }
+
+    /// The workspace that owns `thread`, from `workspace.list`.
+    func workspaceLocation(for thread: NativeThread) -> WorkspaceLocation? {
+        for host in workspaceHosts {
+            if let threadHost = thread.hostID, threadHost != host.id { continue }
+            if let projectID = thread.projectID, let project = host.projects.first(where: { $0.id == projectID }) {
+                return WorkspaceLocation(host: host, project: project)
+            }
+        }
+        for host in workspaceHosts {
+            if let threadHost = thread.hostID, threadHost != host.id { continue }
+            if let project = host.projects.first(where: { WorkspaceFilter.thread(thread, belongsTo: $0) }) {
+                return WorkspaceLocation(host: host, project: project)
+            }
+        }
+        return nil
+    }
+
+    /// The workspace selected in the breadcrumb, when it names one project.
+    var filteredWorkspaceLocation: WorkspaceLocation? {
+        guard let filter = workspaceFilter, let projectID = filter.projectID,
+              let host = workspaceHosts.first(where: { $0.id == filter.hostID }),
+              let project = host.projects.first(where: { $0.id == projectID }) else { return nil }
+        return WorkspaceLocation(host: host, project: project)
+    }
+
+    /// Starts a new session in the same workspace and with the same agent as `threadID`, then opens it.
+    @discardableResult
+    func createSiblingThread(of threadID: String, contextPaths paths: [String] = []) async -> String? {
+        guard let thread = threads.first(where: { $0.id == threadID }) else {
+            issue = threadExposureIssue; return nil
+        }
+        if supportsWorkspaces && workspaceHosts.isEmpty { await loadWorkspaces() }
+        var agentID: String? = thread.agentID
+        if agentID == nil {
+            if createAgents.isEmpty { await loadCreateOptions() }
+            agentID = createAgents.first(where: { $0.name == thread.agentName })?.id
+        }
+        let location: WorkspaceLocation? = workspaceLocation(for: thread)
+        guard let id = await createThread(title: "", agentID: agentID ?? createAgents.first?.id ?? "zed-agent", workspace: location, contextPaths: paths) else { return nil }
+        navigate(toThread: id)
+        return id
+    }
+
+    func setWorkspaceFilter(_ filter: WorkspaceFilter?) {
+        workspaceFilter = filter
+        workspaceIssue = ""
+        guard let profile else { return }
+        if let filter, let data = try? JSONEncoder().encode(filter) {
+            UserDefaults.standard.set(data, forKey: workspaceFilterKey(profile))
+        } else {
+            UserDefaults.standard.removeObject(forKey: workspaceFilterKey(profile))
+        }
+    }
+
+    func matchesWorkspaceFilter(_ thread: NativeThread) -> Bool {
+        guard let workspaceFilter else { return true }
+        return workspaceFilter.matches(thread, in: workspaceHosts)
+    }
+
+    /// Hosts narrowed to the breadcrumb selection.
+    var filteredWorkspaceHosts: [WorkspaceHost] {
+        guard let workspaceFilter else { return workspaceHosts }
+        return workspaceFilter.narrow(workspaceHosts)
     }
 
     private func loadThreads(prefetched: [String: Any]? = nil, includeSummaries: Bool = true) async throws {
@@ -680,7 +794,12 @@ import Network
                                 status: row["status"] as? String ?? "Unknown",
                                 currentTurnID: row["current_turn_id"] as? Int)
             thread.activity = NativeAgentActivity(row["activity"], status: thread.status, currentTurnID: thread.currentTurnID)
-            thread.agentName = (row["agent"] as? [String: Any])?["name"] as? String ?? "Zed Agent"
+            let agent: [String: Any]? = row["agent"] as? [String: Any]
+            thread.agentName = agent?["name"] as? String ?? "Zed Agent"
+            thread.agentID = (agent?["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            thread.hostID = (row["host_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            thread.projectID = (row["project_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            thread.workspacePaths = (row["workspace_paths"] as? [String] ?? []).filter { !$0.isEmpty }
             thread.retrying = row["retry_status"] is [String: Any]
             thread.failed = row["had_error"] as? Bool == true || row["agent_error"] is [String: Any]
             let project: String = (row["project"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1082,7 +1201,18 @@ import Network
                                    linesRemoved: result["lines_removed"] as? Int ?? 0) : nil
         } else { editReview = nil }
         if capabilities.contains("thread.settings") {
-            let result = try await client.rpc("thread.settings", params: base)
+            let result: [String: Any]
+            do {
+                result = try await client.rpc("thread.settings", params: base)
+            } catch let failure as GatewayFailure {
+                // Agents that own their configuration are not an error for the phone.
+                guard case .native(let code) = failure, code == "UNSUPPORTED_CAPABILITY" else { throw failure }
+                guard scope == operationScope else { return }
+                threadSettings = NativeThreadSettings(modelID: nil, providerID: nil, models: [], usedTokens: nil,
+                                                      maxTokens: nil, inputTokens: nil, outputTokens: nil,
+                                                      remainingTokens: nil, editable: false)
+                return
+            }
             guard scope == operationScope else { return }
             let selected = result["model"] as? [String: Any]
             let usage = result["context_usage"] as? [String: Any]
@@ -1102,7 +1232,11 @@ import Network
                                                   profileID: result["profile_id"] as? String,
                                                   profiles: (result["profiles"] as? [[String: Any]] ?? []).compactMap { row in
                                                       guard let id = row["id"] as? String, let name = row["name"] as? String else { return nil }; return NativeAgentProfile(id: id, name: name)
-                                                  }, thinkingEnabled: result["thinking_enabled"] as? Bool, thinkingSupported: result["thinking_supported"] as? Bool ?? false, thinkingCanDisable: result["thinking_can_disable"] as? Bool ?? false)
+                                                  }, thinkingEnabled: result["thinking_enabled"] as? Bool, thinkingSupported: result["thinking_supported"] as? Bool ?? false, thinkingCanDisable: result["thinking_can_disable"] as? Bool ?? false,
+                                                  editable: result["editable"] as? Bool,
+                                                  configurationOwner: result["configuration_owner"] as? String,
+                                                  modes: NativeThreadSettings.decodeModes(result["modes"]),
+                                                  configOptions: NativeThreadSettings.decodeConfigOptions(result["config_options"]))
         } else { threadSettings = nil }
     }
 
@@ -1225,12 +1359,26 @@ import Network
 
     func selectModel(_ option: NativeModelOption) async { await updateAgentSettings(model: option) }
 
-    func updateAgentSettings(model: NativeModelOption? = nil, profileID: String? = nil, thinking: Bool? = nil) async {
+    func selectMode(_ id: String) async { await updateAgentSettings(modeID: id) }
+
+    func selectConfigOption(_ option: NativeConfigOption, value: String) async {
+        await updateAgentSettings(configOption: (option.id, value))
+    }
+
+    func updateAgentSettings(model: NativeModelOption? = nil, profileID: String? = nil, thinking: Bool? = nil,
+                             modeID: String? = nil, configOption: (id: String, value: String)? = nil) async {
         guard state == .live, snapshot?.status == "Idle", !updatingModel, capabilities.contains("thread.settings.update"), let client, let threadID = selectedThreadID, snapshot?.threadID == threadID,
               let settings = threadSettings else { return }
         if let model, !settings.models.contains(where: { $0.id == model.id }) { return }
         if let profileID, !settings.profiles.contains(where: { $0.id == profileID }) { return }
         if let thinking, !settings.thinkingSupported || (!thinking && !settings.thinkingCanDisable) { return }
+        if let modeID, settings.modes?.available.contains(where: { $0.id == modeID }) != true { return }
+        if let modeID, settings.modes?.currentID == modeID { return }
+        if let configOption {
+            guard let option = settings.configOptions.first(where: { $0.id == configOption.id }),
+                  option.options.contains(where: { $0.value == configOption.value }),
+                  option.currentValue != configOption.value else { return }
+        }
         updatingModel = true
         defer { updatingModel = false }
         let scope = operationScope
@@ -1239,6 +1387,8 @@ import Network
             if let model { params["provider_id"] = model.providerID; params["model_id"] = model.id.split(separator: "\n").last.map(String.init) ?? "" }
             if let profileID { params["profile_id"] = profileID }
             if let thinking { params["thinking_enabled"] = thinking }
+            if let modeID { params["mode_id"] = modeID }
+            if let configOption { params["config_option"] = ["id": configOption.id, "value": configOption.value] }
             _ = try await client.rpc("thread.settings.update", params: params)
             guard scope == operationScope else { return }
             try await loadAuxiliaryState(threadID)
@@ -2041,7 +2191,7 @@ import Network
             if !localConfirmed { localCommandScope = operationScope; localCommandText = text; localCommandConfirmation = command; return }
         }
         guard attachments.count + contextPaths.count <= 8 else { issue = "A prompt can include at most eight attachments."; return }
-        guard attachments.isEmpty || supportsImages != false else { issue = "The selected model does not support images. Remove the image or select a supported model."; return }
+        guard !attachments.contains(where: \.isImage) || supportsImages != false else { issue = "The selected model does not support images. Remove the image or select a supported model."; return }
         if !attachments.isEmpty || !contextPaths.isEmpty {
             let command = text.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
             if commands.contains(where: { "/" + $0.name == command && $0.category == "native" }) {
@@ -2132,6 +2282,7 @@ import Network
     }
 
     private func targetKey(_ profile: ConnectionProfile) -> String { "zedlink.target.\(profile.id)" }
+    private func workspaceFilterKey(_ profile: ConnectionProfile) -> String { "zedlink.workspaceFilter.\(profile.id)" }
 
     private func selectedThreadKey(_ profile: ConnectionProfile, targetID: String) -> String {
         "zedlink.selected.\(profile.gatewayID.lowercased()).\(targetID)"

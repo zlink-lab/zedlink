@@ -81,6 +81,12 @@ struct NativeThread: Identifiable, Equatable {
     var activity = NativeAgentActivity.ready
     /// Display name of the Zed project that owns this thread, when desktop Zed reports one.
     var project: String? = nil
+    /// Agent id from `thread.list` (`agent.id`), used to start a sibling session with the same agent.
+    var agentID: String? = nil
+    /// Workspace identity reported by newer bridges; older bridges omit these.
+    var hostID: String? = nil
+    var projectID: String? = nil
+    var workspacePaths: [String] = []
 
     var searchText: String { [title, agentName, id, project ?? ""].joined(separator: " ") }
 }
@@ -203,6 +209,83 @@ struct NativeThreadSettings: Equatable {
     var thinkingEnabled: Bool? = nil
     var thinkingSupported = false
     var thinkingCanDisable = false
+    /// `false` when the agent (for example an external ACP agent) owns its configuration.
+    var editable: Bool? = nil
+    var configurationOwner: String? = nil
+    var modes: NativeSessionModes? = nil
+    var configOptions: [NativeConfigOption] = []
+
+    var managedByAgent: Bool { editable == false }
+    /// Model choices can still be offered for an external agent that advertises them.
+    var canSelectModels: Bool { editable != false || models.contains(where: { $0.providerID == "acp" }) }
+}
+
+struct NativeSessionMode: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let description: String?
+}
+
+struct NativeSessionModes: Equatable {
+    let currentID: String?
+    let available: [NativeSessionMode]
+}
+
+struct NativeConfigChoice: Identifiable, Equatable {
+    let value: String
+    let name: String
+    var id: String { value }
+}
+
+struct NativeConfigOption: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let description: String?
+    let currentValue: String?
+    let options: [NativeConfigChoice]
+}
+
+extension NativeThreadSettings {
+    /// Loosely typed scalar (string, number or bool) as the string the update call sends back.
+    static func scalarText(_ value: Any?) -> String? {
+        if let text = value as? String { return text }
+        if let number = value as? NSNumber { return number.stringValue }
+        return nil
+    }
+
+    /// `modes: {current, available: [{id, name, description}]}`; optional so old bridges still decode.
+    static func decodeModes(_ value: Any?) -> NativeSessionModes? {
+        guard let row = value as? [String: Any] else { return nil }
+        let rows: [[String: Any]] = row["available"] as? [[String: Any]] ?? row["available_modes"] as? [[String: Any]] ?? []
+        let available: [NativeSessionMode] = rows.compactMap { item -> NativeSessionMode? in
+            guard let id = item["id"] as? String, !id.isEmpty else { return nil }
+            let name: String = item["name"] as? String ?? id
+            let detail: String? = (item["description"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            return NativeSessionMode(id: id, name: name.isEmpty ? id : name, description: detail)
+        }
+        guard !available.isEmpty else { return nil }
+        let current: String? = scalarText(row["current"]) ?? scalarText(row["current_mode_id"])
+        return NativeSessionModes(currentID: current, available: available)
+    }
+
+    /// `config_options: [{id, name, description, current_value, options: [{value, name}]}]`.
+    static func decodeConfigOptions(_ value: Any?) -> [NativeConfigOption] {
+        guard let rows = value as? [[String: Any]] else { return [] }
+        return rows.compactMap { row -> NativeConfigOption? in
+            guard let id = row["id"] as? String, !id.isEmpty else { return nil }
+            let choiceRows: [[String: Any]] = row["options"] as? [[String: Any]] ?? []
+            let choices: [NativeConfigChoice] = choiceRows.compactMap { item -> NativeConfigChoice? in
+                guard let value = scalarText(item["value"]) else { return nil }
+                let name: String = item["name"] as? String ?? value
+                return NativeConfigChoice(value: value, name: name.isEmpty ? value : name)
+            }
+            guard !choices.isEmpty else { return nil }
+            let name: String = row["name"] as? String ?? id
+            let detail: String? = (row["description"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            return NativeConfigOption(id: id, name: name.isEmpty ? id : name, description: detail,
+                                      currentValue: scalarText(row["current_value"]), options: choices)
+        }
+    }
 }
 
 struct NativeRewindPoint: Identifiable, Equatable {
@@ -372,6 +455,7 @@ struct PromptAttachment: Identifiable, Equatable {
     let name: String
     let mimeType: String
     let data: Data
+    var isImage: Bool { mimeType.hasPrefix("image/") }
     var payload: [String: Any] { ["name": name, "mime_type": mimeType, "data": data.base64EncodedString()] }
 }
 
@@ -413,6 +497,64 @@ struct WorkspaceHost: Identifiable, Equatable {
     let projects: [WorkspaceProject]
 
     var isSSH: Bool { kind == "ssh" }
+}
+
+/// The breadcrumb selection: a host, optionally narrowed to one of its workspaces.
+/// Labels are kept so the crumb reads correctly before `workspace.list` returns.
+struct WorkspaceFilter: Codable, Equatable {
+    let hostID: String
+    let hostLabel: String
+    var projectID: String? = nil
+    var projectName: String? = nil
+
+    var label: String {
+        guard let projectName else { return hostLabel }
+        return hostLabel + " › " + projectName
+    }
+
+    /// True when `thread` belongs to this host/workspace. Prefers the bridge's `project_id`,
+    /// then `workspace_paths`, then the workspace's history thread ids, then the project name.
+    func matches(_ thread: NativeThread, in hosts: [WorkspaceHost]) -> Bool {
+        if let threadHost = thread.hostID, threadHost != hostID { return false }
+        guard let host = hosts.first(where: { $0.id == hostID }) else {
+            // Without workspace.list only the bridge's own ids can be compared.
+            if let projectID, let threadProject = thread.projectID { return threadProject == projectID }
+            if projectID == nil, thread.hostID != nil { return true }
+            return hosts.isEmpty
+        }
+        if let projectID {
+            if let threadProject = thread.projectID { return threadProject == projectID }
+            guard let project = host.projects.first(where: { $0.id == projectID }) else { return false }
+            return Self.thread(thread, belongsTo: project)
+        }
+        if thread.hostID == hostID { return true }
+        if let threadProject = thread.projectID { return host.projects.contains(where: { $0.id == threadProject }) }
+        return host.projects.contains(where: { Self.thread(thread, belongsTo: $0) })
+    }
+
+    static func thread(_ thread: NativeThread, belongsTo project: WorkspaceProject) -> Bool {
+        if !thread.workspacePaths.isEmpty { return Set(thread.workspacePaths) == Set(project.paths) }
+        if project.threads.contains(where: { $0.id == thread.id }) { return true }
+        guard let name = thread.project else { return false }
+        return name == project.name || project.paths.contains(where: { HostPath.lastComponent($0) == name })
+    }
+
+    /// Narrows `hosts` to the selected host and workspace (used for the "Recent in Zed" list).
+    func narrow(_ hosts: [WorkspaceHost]) -> [WorkspaceHost] {
+        hosts.filter { $0.id == hostID }.map { host in
+            guard let projectID else { return host }
+            let projects: [WorkspaceProject] = host.projects.filter { $0.id == projectID }
+            return WorkspaceHost(id: host.id, kind: host.kind, label: host.label, detail: host.detail,
+                                 connected: host.connected, projects: projects)
+        }
+    }
+}
+
+/// A host/workspace pair a new session is created in.
+struct WorkspaceLocation: Identifiable, Equatable {
+    let host: WorkspaceHost
+    let project: WorkspaceProject
+    var id: String { host.id + "\n" + project.id }
 }
 
 /// A history thread with the project it belongs to, for the "Recent in Zed" list.
