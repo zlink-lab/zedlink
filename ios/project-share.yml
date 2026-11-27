@@ -1,0 +1,48 @@
+# The app plus its ZLinkShare share extension and the App Group group.cx.m42.zlink.
+#
+#   cd ios && xcodegen generate --spec project-share.yml
+#
+# Generates the same ios/ZedLink.xcodeproj as project.yml (XcodeGen merges this file over the
+# included one: dictionaries merge, lists append). Used only by ios-testflight.yml when the
+# IOS_SHARE_PROFILE_BASE64 secret is set; see README-share-extension.md for the Apple-side setup.
+# Bundle ids and profiles come from the xcodebuild command line:
+#   ZLINK_APP_BUNDLE_ID=cx.m42.zlink ZLINK_APP_PROFILE=<uuid> ZLINK_SHARE_PROFILE=<uuid>
+include:
+  - project.yml
+settings:
+  base:
+    ZLINK_APP_BUNDLE_ID: cx.m42.zlink
+    ZLINK_APP_PROFILE: ""
+    ZLINK_SHARE_PROFILE: ""
+targets:
+  ZedLink:
+    dependencies:
+      - target: ZLinkShare
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(ZLINK_APP_BUNDLE_ID)
+        PROVISIONING_PROFILE_SPECIFIER: $(ZLINK_APP_PROFILE)
+        CODE_SIGN_ENTITLEMENTS: ZedLink/ZedLink-share.entitlements
+  ZLinkShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - ZLinkShare
+      # Networking, models, keychain/App Group and uploads shared with the app.
+      - path: ZedLink/SharedSupport.swift
+      - path: ZedLink/GatewayClient.swift
+      - path: ZedLink/Models.swift
+      - path: ZedLink/ProjectUploader.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(ZLINK_APP_BUNDLE_ID).share
+        PROVISIONING_PROFILE_SPECIFIER: $(ZLINK_SHARE_PROFILE)
+        PRODUCT_NAME: ZLinkShare
+        INFOPLIST_FILE: ZLinkShare/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: ZLinkShare/ZLinkShare.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
