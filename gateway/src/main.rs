@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::{self, DirBuilder, OpenOptions, Permissions},
     io::Write,
     net::{IpAddr, SocketAddr},
@@ -54,6 +54,9 @@ const MAX_WEBSOCKETS: usize = 64;
 const EVENT_POLL: Duration = Duration::from_secs(1);
 const NOTIFICATION_POLL: Duration = Duration::from_secs(2);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(12);
+/// A turn that starts this long after the last phone `thread.send` was started on the desktop.
+const PHONE_SEND_WINDOW: Duration = Duration::from_secs(30);
+const MAX_REMOTE_THREADS: usize = 1024;
 
 #[derive(Clone)]
 struct Gateway(Arc<Inner>);
@@ -70,6 +73,8 @@ struct Inner {
     shutdown: Arc<Notify>,
     push_client: IsahcWebPushClient,
     apns: Option<ApnsProvider>,
+    /// When the phone last sent a message to a thread (`target:thread` key).
+    phone_sends: Mutex<HashMap<String, Instant>>,
 }
 struct ApnsProvider {
     team_id: String,
@@ -95,6 +100,10 @@ struct Persisted {
     push_subscriptions: Vec<PushSubscription>,
     #[serde(default)]
     apns_devices: Vec<ApnsDevice>,
+    /// Threads (`target:thread`) whose latest user message came from the phone.
+    /// Push notifications are sent only for these threads.
+    #[serde(default)]
+    remote_threads: BTreeSet<String>,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ApnsDevice {
@@ -228,6 +237,23 @@ fn pending_approval_keys(snapshot: &Value) -> HashSet<String> {
         );
     }
     keys
+}
+
+fn remote_thread_key(target_id: &str, thread_id: &str) -> String {
+    format!("{target_id}:{thread_id}")
+}
+
+/// Whether the bridge reported a user message typed in desktop Zed.
+fn has_local_user_message(events: &Value, through_sequence: u64) -> bool {
+    events.as_array().is_some_and(|events| {
+        events.iter().any(|event| {
+            event["entry_kind"] == "user"
+                && event["origin"] == "local"
+                && event["sequence"]
+                    .as_u64()
+                    .is_some_and(|sequence| sequence <= through_sequence)
+        })
+    })
 }
 
 fn latest_stop_reason(events: &Value, through_sequence: u64) -> Option<&str> {
@@ -856,6 +882,7 @@ impl Gateway {
                 vapid_private_key: new_vapid_private_key(),
                 push_subscriptions: vec![],
                 apns_devices: vec![],
+                remote_threads: BTreeSet::new(),
             };
             save(&directory, &initial)?;
             initial
@@ -880,6 +907,7 @@ impl Gateway {
             shutdown: Arc::new(Notify::new()),
             push_client: IsahcWebPushClient::new().context("Web Push client unavailable")?,
             apns: ApnsProvider::from_environment()?,
+            phone_sends: Mutex::new(HashMap::new()),
         })))
     }
     async fn authorize(&self, headers: &HeaderMap) -> Option<Uuid> {
@@ -1175,6 +1203,50 @@ impl Gateway {
         }
     }
 
+    /// Marks a thread as driven from the phone (`remote`) or from the desktop.
+    async fn set_remote_thread(&self, target_id: &str, thread_id: &str, remote: bool) {
+        let key = remote_thread_key(target_id, thread_id);
+        if remote {
+            let mut sends = self.0.phone_sends.lock().await;
+            sends.retain(|_, sent| sent.elapsed() < PHONE_SEND_WINDOW);
+            sends.insert(key.clone(), Instant::now());
+        }
+        let mut persisted = self.0.persisted.lock().await;
+        if persisted.remote_threads.contains(&key) == remote {
+            return;
+        }
+        let mut next = persisted.clone();
+        if remote {
+            while next.remote_threads.len() >= MAX_REMOTE_THREADS {
+                next.remote_threads.pop_first();
+            }
+            next.remote_threads.insert(key);
+        } else {
+            next.remote_threads.remove(&key);
+        }
+        if save(&self.0.directory, &next).is_ok() {
+            *persisted = next;
+        }
+    }
+
+    async fn is_remote_thread(&self, target_id: &str, thread_id: &str) -> bool {
+        self.0
+            .persisted
+            .lock()
+            .await
+            .remote_threads
+            .contains(&remote_thread_key(target_id, thread_id))
+    }
+
+    async fn phone_sent_recently(&self, target_id: &str, thread_id: &str) -> bool {
+        self.0
+            .phone_sends
+            .lock()
+            .await
+            .get(&remote_thread_key(target_id, thread_id))
+            .is_some_and(|sent| sent.elapsed() < PHONE_SEND_WINDOW)
+    }
+
     async fn notify_all(&self, body: &'static str, target_id: &str, thread_id: &str) {
         let persisted = self.0.persisted.lock().await;
         let subscriptions = persisted.push_subscriptions.clone();
@@ -1321,33 +1393,47 @@ impl Gateway {
                         had_error,
                         last_sequence,
                     };
-                    let stop_reason = if let Some(previous) = prior.get(&key) {
+                    let mut stop_reason = None;
+                    if let Some(previous) = prior.get(&key) {
                         let events_request = json!({
                             "version": 1,
                             "request_id": Uuid::new_v4().to_string(),
                             "method": "thread.events",
                             "params": {"thread_id": thread_id, "after_sequence": previous.last_sequence},
                         });
-                        self.probe(Some(&target.id), &events_request)
+                        let events = self
+                            .probe(Some(&target.id), &events_request)
                             .await
                             .ok()
                             .filter(|events| {
                                 events["result"]["instance_id"].as_str() == Some(instance)
                                     && events["result"]["epoch"].as_str() == Some(epoch)
+                            });
+                        let events = events.as_ref().map(|events| &events["result"]["events"]);
+                        stop_reason = events
+                            .and_then(|events| latest_stop_reason(events, last_sequence))
+                            .map(str::to_owned);
+                        // A message typed in desktop Zed hands the thread back to the desktop.
+                        // Bridges without message origins fall back to: a turn that started
+                        // without a recent phone send was started on the desktop.
+                        let desktop_turn_started = previous.status != "Generating"
+                            && observation.status == "Generating"
+                            && !self.phone_sent_recently(&target.id, thread_id).await;
+                        if desktop_turn_started
+                            || events.is_some_and(|events| {
+                                has_local_user_message(events, last_sequence)
                             })
-                            .and_then(|events| {
-                                latest_stop_reason(&events["result"]["events"], last_sequence)
-                                    .map(str::to_owned)
-                            })
-                    } else {
-                        None
-                    };
+                        {
+                            self.set_remote_thread(&target.id, thread_id, false).await;
+                        }
+                    }
                     let initial = ThreadObservation::default();
                     if let Some(body) = thread_notification(
                         prior.get(&key).unwrap_or(&initial),
                         &observation,
                         stop_reason.as_deref(),
-                    ) {
+                    ) && self.is_remote_thread(&target.id, thread_id).await
+                    {
                         self.notify_all(body, &target.id, thread_id).await;
                     }
                     current.insert(key, observation);
@@ -2265,6 +2351,15 @@ async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> i
     }
     match state.probe(target_id.as_deref(), &request).await {
         Ok(mut response) => {
+            if method == "thread.send"
+                && response.get("error").is_none_or(Value::is_null)
+                && let (Ok(target), Some(thread_id)) = (
+                    state.target(target_id.as_deref()),
+                    request["params"]["thread_id"].as_str(),
+                )
+            {
+                state.set_remote_thread(&target.id, thread_id, true).await;
+            }
             response["request_id"] = json!(original_request_id);
             (StatusCode::OK, Json(response))
         }
@@ -2659,5 +2754,17 @@ mod tests {
         assert_eq!(latest_stop_reason(&events, 5), Some("completed"));
         assert_eq!(latest_stop_reason(&events, 6), Some("cancelled"));
         assert_eq!(latest_stop_reason(&events, 3), None);
+    }
+
+    #[test]
+    fn only_desktop_user_messages_release_remote_threads() {
+        let events = json!([
+            {"sequence": 2, "kind": "entry.added", "entry_kind": "user", "origin": "remote"},
+            {"sequence": 3, "kind": "entry.added"},
+            {"sequence": 5, "kind": "entry.added", "entry_kind": "user", "origin": "local"},
+        ]);
+        assert!(!has_local_user_message(&events, 4));
+        assert!(has_local_user_message(&events, 5));
+        assert!(!has_local_user_message(&json!([]), 9));
     }
 }
