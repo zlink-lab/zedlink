@@ -1,6 +1,13 @@
 import XCTest
 
 final class OnboardingUITests: XCTestCase {
+    /// Connections live in Settings › Connection & access.
+    private func openConnections(_ app: XCUIApplication) {
+        app.tabBars.buttons["Settings"].tap()
+        let entry = app.buttons["settings-connections"]
+        if entry.waitForExistence(timeout: 3) { entry.tap() }
+    }
+
     func testLightThemeAndSystemTabs() {
         let app = XCUIApplication()
         app.launchArguments = ["-zedlink.appearance", "light"]
@@ -28,7 +35,7 @@ final class OnboardingUITests: XCTestCase {
         searchKey.tap()
         XCTAssertFalse(app.keyboards.firstMatch.waitForExistence(timeout: 1))
 
-        app.tabBars.buttons["Connections"].tap()
+        openConnections(app)
         XCTAssertTrue(app.staticTexts["No connections"].waitForExistence(timeout: 5))
     }
 
@@ -37,7 +44,7 @@ final class OnboardingUITests: XCTestCase {
         app.launch()
 
         XCTAssertTrue(app.staticTexts["Choose a connection"].waitForExistence(timeout: 10))
-        app.tabBars.buttons["Connections"].tap()
+        openConnections(app)
         XCTAssertTrue(app.staticTexts["No connections"].waitForExistence(timeout: 5))
         app.buttons["add-connection"].tap()
 
@@ -59,14 +66,14 @@ final class OnboardingUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["--zedlink-demo"]
         app.launch()
-        app.tabBars.buttons["Connections"].tap()
+        openConnections(app)
         app.buttons["add-connection"].tap()
         let endpoint = app.textFields["gateway-endpoint"]
         XCTAssertTrue(endpoint.waitForExistence(timeout: 5))
         endpoint.tap(); endpoint.typeText("https://demo.invalid")
         app.buttons["Close"].tap()
-        app.tabBars.buttons["Settings"].tap()
-        app.tabBars.buttons["Connections"].tap()
+        app.tabBars.buttons["Сводка"].tap()
+        openConnections(app)
         app.buttons["add-connection"].tap()
         XCTAssertEqual(app.textFields["gateway-endpoint"].value as? String, "https://demo.invalid")
     }

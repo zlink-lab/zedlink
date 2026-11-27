@@ -3,6 +3,9 @@ import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var session: SessionManager
+    @Binding var connectionDraft: ConnectionDraft
+    /// Set by "Manage connections" anywhere in the app; opens Connections inside Settings.
+    @Binding var showingConnections: Bool
     @ObservedObject private var notifications = ApprovalNotifications.shared
     @AppStorage("zedlink.appearance") private var appearance = "dark"
     @AppStorage(DictationLanguage.storageKey) private var dictationLanguage = "system"
@@ -26,8 +29,8 @@ struct SettingsView: View {
                     }
                 }
                 Section("Connection & access") {
-                    Button { session.showConnections = true } label: {
-                        SettingsSummary(title: session.profile?.name ?? "Choose a connection", value: "Manage connections")
+                    Button { showingConnections = true } label: {
+                        SettingsSummary(title: session.profile?.name ?? "Choose a connection", value: "Connections · pair, switch and check")
                     }.accessibilityIdentifier("settings-connections")
                     ConnectionStatusView(state: session.state)
                     NavigationLink("Diagnostics") { ConnectionDiagnosticsView() }
@@ -37,6 +40,9 @@ struct SettingsView: View {
                     NavigationLink("Help & about") { SettingsHelpView() }
                 }
             }.settingsList().navigationTitle("Settings").navigationBarTitleDisplayMode(.inline)
+                .navigationDestination(isPresented: $showingConnections) {
+                    ConnectionsView(draft: $connectionDraft, embedded: true)
+                }
                 .task { await notifications.refreshStatus() }
         }
     }

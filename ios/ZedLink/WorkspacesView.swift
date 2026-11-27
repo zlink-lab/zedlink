@@ -40,7 +40,8 @@ struct WorkspacesView: View {
     private var hostList: some View {
         List {
             statusSection
-            ForEach(session.workspaceHosts) { host in
+            // SSH connections Zed saved without a project (bare IPs) are hidden.
+            ForEach(session.visibleWorkspaceHosts) { host in
                 hostSection(host)
             }
         }
@@ -248,10 +249,11 @@ private struct WorkspaceProjectRow: View {
 }
 
 private struct WorkspaceThreadLabel: View {
+    @EnvironmentObject private var session: SessionManager
     let thread: WorkspaceHistoryThread
 
     private var meta: String {
-        var parts: [String] = [thread.agent]
+        var parts: [String] = [session.agentDisplayName(thread.agent)]
         if let date = thread.updatedAt { parts.append(date.formatted(.relative(presentation: .named))) }
         if !thread.loaded { parts.append("Not loaded") }
         return parts.joined(separator: " · ")

@@ -1,7 +1,7 @@
 import SwiftUI
 
-// The Sessions header crumb: host › workspace from `workspace.list`, which also filters the
-// sessions list. Bodies stay small: Swift 6.1 times out on large view expressions.
+// The Sessions header crumb: connection › host › workspace (host and workspace from
+// `workspace.list`), which also filters the sessions list. Bodies stay small: Swift 6.1 times out on large view expressions.
 
 struct WorkspaceBreadcrumbMenu: View {
     @EnvironmentObject private var session: SessionManager
@@ -9,7 +9,7 @@ struct WorkspaceBreadcrumbMenu: View {
     var body: some View {
         Menu {
             allWorkspacesButton
-            ForEach(session.workspaceHosts) { host in
+            ForEach(session.visibleWorkspaceHosts) { host in
                 WorkspaceHostMenu(host: host)
             }
             if session.workspaceHosts.isEmpty && session.supportsWorkspaces {
@@ -21,32 +21,33 @@ struct WorkspaceBreadcrumbMenu: View {
             crumbLabel
         }
         .accessibilityIdentifier("zed-target-picker")
-        .accessibilityLabel("Workspace: " + crumbAccessibilityText)
+        .accessibilityLabel("Connection and workspace: " + crumbAccessibilityText)
     }
 
-    private var crumbLeading: String {
-        guard let filter = session.workspaceFilter else { return session.profile?.name ?? "Choose a connection" }
-        return filter.hostLabel
-    }
-
-    private var crumbTrailing: String {
-        guard session.profile != nil else { return "Workspace" }
-        guard let filter = session.workspaceFilter else {
-            if !session.supportsWorkspaces, let target = session.targets.first(where: { $0.id == session.targetID }) {
-                return target.label
-            }
-            return "All workspaces"
+    /// `connection › host › workspace`; "All workspaces" when no host is chosen.
+    private var crumbParts: [String] {
+        guard let profile = session.profile else { return ["Choose a connection"] }
+        var parts: [String] = [profile.name]
+        if let filter = session.workspaceFilter {
+            parts.append(filter.hostLabel)
+            parts.append(filter.projectName ?? "All workspaces")
+        } else if !session.supportsWorkspaces, let target = session.targets.first(where: { $0.id == session.targetID }) {
+            parts.append(target.label)
+        } else {
+            parts.append("All workspaces")
         }
-        return filter.projectName ?? "All workspaces"
+        return parts
     }
 
-    private var crumbAccessibilityText: String { crumbLeading + ", " + crumbTrailing }
+    private var crumbAccessibilityText: String { crumbParts.joined(separator: ", ") }
 
     private var crumbLabel: some View {
-        HStack(spacing: 5) {
-            Text(crumbLeading).lineLimit(1)
-            Image(systemName: "chevron.right").font(.caption2)
-            Text(crumbTrailing).lineLimit(1)
+        let parts: [String] = crumbParts
+        return HStack(spacing: 5) {
+            ForEach(Array(parts.enumerated()), id: \.offset) { index, part in
+                if index > 0 { Image(systemName: "chevron.right").font(.caption2) }
+                Text(part).lineLimit(1)
+            }
             Image(systemName: "chevron.down").font(.caption2)
         }
         .font(.caption).frame(minHeight: 44).foregroundStyle(ZLTheme.ink)

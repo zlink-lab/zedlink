@@ -292,3 +292,28 @@ func promptFileName(_ raw: String) -> String {
     while name.hasPrefix(".") { name.removeFirst() }
     return name.trimmingCharacters(in: .whitespaces).isEmpty ? "attachment.txt" : name
 }
+
+/// A phone file read for `project.upload.*` (any type, up to 25 MiB).
+struct PhoneFile {
+    let name: String
+    let mimeType: String
+    let data: Data
+}
+
+enum UploadFileImport {
+    case success(PhoneFile)
+    case failure(String)
+}
+
+func readUploadFile(_ url: URL) -> UploadFileImport {
+    let scoped: Bool = url.startAccessingSecurityScopedResource()
+    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+    let values: URLResourceValues? = try? url.resourceValues(forKeys: [.contentTypeKey, .fileSizeKey, .isDirectoryKey])
+    if values?.isDirectory == true { return .failure("Choose a file, not a folder.") }
+    if let size = values?.fileSize, size > 25 * 1024 * 1024 { return .failure("Files can be up to 25 MiB.") }
+    guard let data = try? Data(contentsOf: url) else { return .failure("This file could not be read on the phone.") }
+    guard data.count <= 25 * 1024 * 1024 else { return .failure("Files can be up to 25 MiB.") }
+    let type: UTType? = values?.contentType ?? UTType(filenameExtension: url.pathExtension)
+    let mimeType: String = type?.preferredMIMEType ?? "application/octet-stream"
+    return .success(PhoneFile(name: url.lastPathComponent, mimeType: mimeType, data: data))
+}
