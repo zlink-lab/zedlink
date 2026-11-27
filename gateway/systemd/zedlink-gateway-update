@@ -142,10 +142,14 @@ def main():
         available = releases()
         if options.tag:
             available = [release for release in available if release["tag_name"] == options.tag]
-        else:
+        elif available:
             # A release that failed to start is not retried every hour; `--tag` forces it.
-            available = [release for release in available
-                         if not (ROOT / f"failed-{release['tag_name']}").exists()]
+            usable = [release for release in available
+                      if not (ROOT / f"failed-{release['tag_name']}").exists()]
+            if not usable:
+                log(f"nothing new: {available[0]['tag_name']} failed to start earlier (use --tag to retry)")
+                return 0
+            available = usable
         if not available:
             log("no gateway release found")
             return 1
