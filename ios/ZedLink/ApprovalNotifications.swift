@@ -138,8 +138,11 @@ final class ZedLinkAPNsDelegate: NSObject, UIApplicationDelegate {
         let review = UNNotificationAction(identifier: "review", title: "Review request", options: [.foreground, .authenticationRequired])
         let deny = UNNotificationAction(identifier: "deny", title: "Deny once", options: [.foreground, .authenticationRequired, .destructive])
         let approve = UNNotificationAction(identifier: "approve", title: "Approve once", options: [.foreground, .authenticationRequired])
+        // Gateway `zed_hung` alerts; the app confirms again if Agent turns are running.
+        let restartZed = UNNotificationAction(identifier: "restart_zed", title: "Перезапустить Zed", options: [.foreground, .authenticationRequired])
         center.setNotificationCategories([
             UNNotificationCategory(identifier: "ZEDLINK_REVIEW", actions: [review], intentIdentifiers: []),
+            UNNotificationCategory(identifier: "ZEDLINK_ZED", actions: [restartZed], intentIdentifiers: []),
             // Keep the default action harmless on watch gestures; approval is never first.
             UNNotificationCategory(identifier: "ZEDLINK_PERMISSION", actions: [review, deny, approve], intentIdentifiers: [])
         ])

@@ -62,6 +62,96 @@ struct SessionIssueBanner: View {
     }
 }
 
+/// Zed itself is closed, hung or restarting (gateway `zed.status`), with start/restart when the
+/// gateway controls this Zed. Hidden while the connection is Live and Zed answers.
+struct ZedControlBanner: View {
+    @EnvironmentObject private var session: SessionManager
+
+    private func title(_ health: ZedHealth) -> String {
+        switch health {
+        case .down: "Zed не запущен"
+        case .hung: "Zed не отвечает"
+        case .starting: "Запуск Zed…"
+        case .restarting: "Перезапуск Zed…"
+        case .running, .unknown: "Zed"
+        }
+    }
+
+    var body: some View {
+        let health: ZedHealth = session.zedHealth
+        let issue: String = session.zedIssue
+        if session.showsZedControl && ((health != .running && health != .unknown) || !issue.isEmpty) {
+            HStack(alignment: .center, spacing: 8) {
+                if health == .starting || health == .restarting {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "exclamationmark.triangle").foregroundStyle(ZLTheme.warning)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title(health)).font(.footnote.weight(.semibold))
+                    if !issue.isEmpty {
+                        Text(issue).font(.footnote).foregroundStyle(ZLTheme.danger).fixedSize(horizontal: false, vertical: true)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+                ZedControlButton()
+                if !issue.isEmpty {
+                    Button { session.clearZedIssue() } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }
+                        .accessibilityLabel("Dismiss Zed error")
+                }
+            }.padding(.leading, 12).padding(.trailing, 4).padding(.vertical, 6)
+                .frame(minHeight: 44)
+                .background(ZLTheme.surface)
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("zed-control-banner")
+        }
+    }
+}
+
+/// "Запустить Zed" when Zed is closed, "Перезапустить Zed" (with confirmation) otherwise.
+struct ZedControlButton: View {
+    @EnvironmentObject private var session: SessionManager
+
+    var body: some View {
+        if session.canControlZed {
+            switch session.zedHealth {
+            case .down:
+                Button("Запустить Zed") { Task { await session.startZed() } }
+                    .buttonStyle(.bordered).frame(minHeight: 44)
+                    .accessibilityIdentifier("zed-start")
+            case .hung, .running:
+                Button("Перезапустить Zed") { session.requestZedRestart() }
+                    .buttonStyle(.bordered).frame(minHeight: 44)
+                    .accessibilityIdentifier("zed-restart")
+            case .starting, .restarting, .unknown:
+                EmptyView()
+            }
+        }
+    }
+}
+
+/// The Zed restart confirmation, attached once at the app root so the banner, Settings and the
+/// "Перезапустить Zed" alert action share it. After `TURNS_RUNNING` it asks again with the count.
+struct ZedRestartDialog: ViewModifier {
+    @ObservedObject var session: SessionManager
+
+    private var presented: Binding<Bool> {
+        Binding(get: { session.zedRestartPrompt != nil },
+                set: { if !$0 { session.zedRestartPrompt = nil } })
+    }
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(session.zedRestartPrompt?.title ?? "Перезапустить Zed?", isPresented: presented,
+                                   titleVisibility: .visible, presenting: session.zedRestartPrompt) { prompt in
+            Button(prompt.confirmTitle, role: .destructive) {
+                Task { await session.restartZed(force: prompt.force) }
+            }
+            Button("Отмена", role: .cancel) {}
+        } message: { prompt in
+            Text(prompt.message)
+        }
+    }
+}
+
 struct ReviewLine: Identifiable {
     enum Kind: Equatable { case plain, added, removed, header }
     let id: Int

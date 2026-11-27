@@ -45,6 +45,11 @@ import SwiftUI
                 // Connections live in Settings › Connection & access.
                 if requested { sessionsPath = []; selectedTab = 2; showingConnections = true; session.showConnections = false }
             }
+            .onChange(of: session.showZedControl) { _, requested in
+                // A tapped "Zed не отвечает" alert: Settings › Connection & access shows Zed's status.
+                if requested { selectedTab = 2; session.showZedControl = false }
+            }
+            .modifier(ZedRestartDialog(session: session))
             .onChange(of: session.threads) { _, threads in
                 guard !session.demoPreview else { return }
                 summary.absorb(threads, profile: session.profile, targetID: session.targetID, hosts: session.workspaceHosts)
