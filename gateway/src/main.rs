@@ -31,7 +31,7 @@ use std::{
     os::unix::net::UnixStream as StdUnixStream,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -57,6 +57,11 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(12);
 /// A turn that starts this long after the last phone `thread.send` was started on the desktop.
 const PHONE_SEND_WINDOW: Duration = Duration::from_secs(30);
 const MAX_REMOTE_THREADS: usize = 1024;
+/// Bursts of client requests wait this long for a probe slot instead of failing at once.
+const PROBE_SLOT_WAIT: Duration = Duration::from_secs(5);
+/// The same failing method/code pair is logged at most once per window.
+const FAILURE_LOG_WINDOW: Duration = Duration::from_secs(30);
+const PUSH_PREVIEW_CHARS: usize = 120;
 
 #[derive(Clone)]
 struct Gateway(Arc<Inner>);
@@ -75,6 +80,7 @@ struct Inner {
     apns: Option<ApnsProvider>,
     /// When the phone last sent a message to a thread (`target:thread` key).
     phone_sends: Mutex<HashMap<String, Instant>>,
+    failure_log: std::sync::Mutex<HashMap<String, Instant>>,
 }
 struct ApnsProvider {
     team_id: String,
@@ -180,41 +186,175 @@ struct ThreadObservation {
     last_sequence: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotificationEvent {
+    Approval,
+    Input,
+    Done,
+    Error,
+    Stopped(&'static str),
+}
+
+impl NotificationEvent {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Input => "input",
+            Self::Done => "done",
+            Self::Error => "error",
+            Self::Stopped(_) => "stopped",
+        }
+    }
+}
+
 fn thread_notification(
     previous: &ThreadObservation,
     current: &ThreadObservation,
     stop_reason: Option<&str>,
-) -> Option<&'static str> {
+) -> Option<NotificationEvent> {
     if current
         .approvals
         .iter()
         .any(|id| !previous.approvals.contains(id))
     {
-        Some("A Zed Agent session needs your approval.")
+        Some(NotificationEvent::Approval)
     } else if current
         .inputs
         .iter()
         .any(|id| !previous.inputs.contains(id))
     {
-        Some("A Zed Agent session needs your input.")
+        Some(NotificationEvent::Input)
     } else if let Some(reason) = stop_reason {
-        match reason {
-            "completed" if current.had_error => Some("A Zed Agent session failed."),
-            "completed" => Some("A Zed Agent session completed."),
-            "cancelled" => Some("A Zed Agent session was cancelled."),
-            "max_turn_requests" => Some("A Zed Agent session reached its turn request limit."),
-            "max_tokens" => Some("A Zed Agent session reached its output limit."),
-            "refusal" => Some("A Zed Agent request was refused."),
-            "error" => Some("A Zed Agent session stopped with an error."),
-            _ => Some("A Zed Agent session stopped. Open it to review the reason."),
-        }
+        Some(match reason {
+            "completed" if current.had_error => NotificationEvent::Error,
+            "completed" => NotificationEvent::Done,
+            "error" => NotificationEvent::Error,
+            "cancelled" => NotificationEvent::Stopped("отменено"),
+            "max_turn_requests" => NotificationEvent::Stopped("лимит запросов"),
+            "max_tokens" => NotificationEvent::Stopped("лимит длины ответа"),
+            "refusal" => NotificationEvent::Stopped("модель отказалась"),
+            _ => NotificationEvent::Stopped("причина в треде"),
+        })
     } else if !previous.had_error && current.had_error {
-        Some("A Zed Agent session failed.")
+        Some(NotificationEvent::Error)
     } else if previous.status == "Generating" && current.status == "Idle" {
-        Some("A Zed Agent session stopped. Open it to review the result.")
+        Some(NotificationEvent::Done)
     } else {
         None
     }
+}
+
+/// What the lock screen shows; built from the bridge's thread row and snapshot.
+#[derive(Clone, Debug)]
+struct PushMessage {
+    title: String,
+    subtitle: Option<String>,
+    body: String,
+    event: NotificationEvent,
+    target_id: String,
+    thread_id: String,
+    instance_id: String,
+    epoch: String,
+    project_id: Option<String>,
+    host_id: Option<String>,
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= limit {
+        collapsed
+    } else {
+        let mut cut = collapsed.chars().take(limit).collect::<String>();
+        cut.push('…');
+        cut
+    }
+}
+
+fn last_agent_reply(snapshot: &Value) -> Option<String> {
+    snapshot["entries_meta"]
+        .as_array()?
+        .iter()
+        .rev()
+        .filter(|entry| entry["kind"] == "assistant")
+        .find_map(|entry| {
+            let text = entry["segments"]
+                .as_array()?
+                .iter()
+                .filter(|segment| segment["kind"] == "assistant")
+                .filter_map(|segment| segment["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let text = truncate_chars(&text, PUSH_PREVIEW_CHARS);
+            (!text.is_empty()).then_some(text)
+        })
+}
+
+fn push_body(event: NotificationEvent, snapshot: &Value) -> String {
+    match event {
+        NotificationEvent::Approval => snapshot["pending_approvals"]
+            .as_array()
+            .and_then(|approvals| approvals.last())
+            .and_then(|approval| {
+                approval["tool_name"]
+                    .as_str()
+                    .or_else(|| approval["display"].as_str())
+            })
+            .map(|tool| format!("Нужно подтверждение: {}", truncate_chars(tool, 80)))
+            .unwrap_or_else(|| "Нужно подтверждение".to_owned()),
+        NotificationEvent::Input => "Ждёт ответа".to_owned(),
+        NotificationEvent::Done => last_agent_reply(snapshot)
+            .map(|reply| format!("Готово: {reply}"))
+            .unwrap_or_else(|| "Готово".to_owned()),
+        NotificationEvent::Error => snapshot["agent_error"]["message"]
+            .as_str()
+            .or_else(|| snapshot["agent_error"]["title"].as_str())
+            .map(|message| format!("Ошибка: {}", truncate_chars(message, PUSH_PREVIEW_CHARS)))
+            .unwrap_or_else(|| "Ошибка".to_owned()),
+        NotificationEvent::Stopped(reason) => format!("Остановлено: {reason}"),
+    }
+}
+
+fn nonempty(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn push_heading(row: &Value, snapshot: &Value) -> (String, Option<String>) {
+    let title = nonempty(&snapshot["title"])
+        .or_else(|| nonempty(&row["title"]))
+        .map(|title| truncate_chars(title, 80))
+        .unwrap_or_else(|| "ZLink".to_owned());
+    let host = nonempty(&row["host_label"]);
+    let workspace = nonempty(&row["workspace_label"]).or_else(|| nonempty(&row["project"]));
+    let subtitle = [host, workspace]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    (title, (!subtitle.is_empty()).then_some(subtitle))
+}
+
+fn apns_payload(message: &PushMessage, gateway_id: &str, created: u64) -> Value {
+    let mut alert = json!({"title": message.title, "body": message.body});
+    if let Some(subtitle) = &message.subtitle {
+        alert["subtitle"] = json!(subtitle);
+    }
+    json!({"aps": {"alert": alert, "sound": "default", "category": "ZEDLINK_REVIEW",
+            "thread-id": message.thread_id},
+        "type": "push", "event": message.event.kind(),
+        "gateway": gateway_id, "target": message.target_id, "thread": message.thread_id,
+        "instance": message.instance_id, "epoch": message.epoch, "created": created,
+        "project_id": message.project_id, "host_id": message.host_id})
+}
+
+fn apns_collapse_id(message: &PushMessage) -> String {
+    let mut id = format!("{}:{}", message.thread_id, message.event.kind());
+    while id.len() > 64 {
+        id.pop();
+    }
+    id
 }
 
 fn pending_approval_keys(snapshot: &Value) -> HashSet<String> {
@@ -749,13 +889,13 @@ impl ApnsProvider {
         Ok(key.with_key_id(&self.key_id).sign(claims)?)
     }
 
+    /// `message` is a thread notification; without one this is the device test push.
     async fn send(
         &self,
         registration: &ApnsDevice,
-        body: &str,
+        test_body: &str,
         gateway_id: &str,
-        target_id: Option<&str>,
-        thread_id: Option<&str>,
+        message: Option<&PushMessage>,
     ) -> PushOutcome {
         if !valid_apns_token(&registration.token) {
             return PushOutcome::Failed;
@@ -768,18 +908,26 @@ impl ApnsProvider {
         } else {
             "api.push.apple.com"
         };
-        let payload = json!({"aps": {"alert": {"title": "ZedLink", "body": body},
-            "sound": "default", "category": "ZEDLINK_REVIEW"},
-            "gateway": gateway_id, "target": target_id, "thread": thread_id,
-            "type": if thread_id.is_some() { "push" } else { "push_test" }});
-        let request =
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let payload = match message {
+            Some(message) => apns_payload(message, gateway_id, created),
+            None => json!({"aps": {"alert": {"title": "ZLink", "body": test_body},
+                "sound": "default", "category": "ZEDLINK_REVIEW"},
+                "gateway": gateway_id, "type": "push_test", "created": created}),
+        };
+        let mut request =
             isahc::Request::post(format!("https://{host}/3/device/{}", registration.token))
                 .header("authorization", format!("bearer {token}"))
                 .header("apns-topic", self.topic.as_str())
                 .header("apns-push-type", "alert")
                 .header("apns-expiration", "0")
-                .header("content-type", "application/json")
-                .body(payload.to_string());
+                .header("content-type", "application/json");
+        if let Some(message) = message {
+            request = request.header("apns-collapse-id", apns_collapse_id(message));
+        }
+        let request = request.body(payload.to_string());
         let Ok(request) = request else {
             return PushOutcome::Failed;
         };
@@ -917,6 +1065,7 @@ impl Gateway {
             push_client: IsahcWebPushClient::new().context("Web Push client unavailable")?,
             apns: ApnsProvider::from_environment()?,
             phone_sends: Mutex::new(HashMap::new()),
+            failure_log: std::sync::Mutex::new(HashMap::new()),
         })))
     }
     async fn authorize(&self, headers: &HeaderMap) -> Option<Uuid> {
@@ -956,13 +1105,52 @@ impl Gateway {
         }
     }
 
+    /// Logs failed native requests (method and error code only, never params) so a
+    /// "Live but no data" phone can be diagnosed from the gateway journal.
     async fn probe(&self, target_id: Option<&str>, request: &Value) -> Result<Value> {
-        let _permit = self
-            .0
-            .probe_limit
-            .clone()
-            .try_acquire_owned()
-            .context("probe request limit reached")?;
+        let method = request["method"].as_str().unwrap_or("?");
+        let result = self.probe_native(target_id, request).await;
+        let failure = match &result {
+            Ok(response) => response["error"]["code"]
+                .as_str()
+                .or_else(|| response["error"].as_str())
+                .map(str::to_owned),
+            Err(error) => Some(format!("{error:#}")),
+        };
+        if let Some(failure) = failure {
+            self.log_failure(&format!(
+                "probe {method} target={} failed: {failure}",
+                target_id.unwrap_or("default")
+            ));
+        }
+        result
+    }
+
+    fn log_failure(&self, line: &str) {
+        let now = Instant::now();
+        let Ok(mut log) = self.0.failure_log.lock() else {
+            eprintln!("{line}");
+            return;
+        };
+        if log.len() > 512 {
+            log.retain(|_, logged| now.duration_since(*logged) < FAILURE_LOG_WINDOW);
+        }
+        if log
+            .get(line)
+            .is_some_and(|logged| now.duration_since(*logged) < FAILURE_LOG_WINDOW)
+        {
+            return;
+        }
+        log.insert(line.to_owned(), now);
+        drop(log);
+        eprintln!("{line}");
+    }
+
+    async fn probe_native(&self, target_id: Option<&str>, request: &Value) -> Result<Value> {
+        let _permit =
+            tokio::time::timeout(PROBE_SLOT_WAIT, self.0.probe_limit.clone().acquire_owned())
+                .await
+                .context("probe request limit reached")??;
         let encoded = serde_json::to_vec(request)?;
         if encoded.len() > MAX_RPC {
             bail!("oversized probe request");
@@ -1168,9 +1356,11 @@ impl Gateway {
         &self,
         record: &PushSubscription,
         body: &str,
-        thread_id: Option<&str>,
-        target_id: Option<&str>,
+        message: Option<&PushMessage>,
     ) -> PushOutcome {
+        let thread_id = message.map(|message| message.thread_id.as_str());
+        let target_id = message.map(|message| message.target_id.as_str());
+        let approval = message.is_some_and(|message| message.event == NotificationEvent::Approval);
         let private_key = self.0.persisted.lock().await.vapid_private_key.clone();
         let signature = match VapidSignatureBuilder::from_base64(&private_key, &record.subscription)
             .and_then(|builder| builder.build())
@@ -1179,12 +1369,13 @@ impl Gateway {
             Err(_) => return PushOutcome::Failed,
         };
         let payload = json!({
-            "title": "ZedLink",
-            "body": body,
+            "title": message.map_or("ZLink", |message| message.title.as_str()),
+            "subtitle": message.and_then(|message| message.subtitle.as_deref()),
+            "body": message.map_or(body, |message| message.body.as_str()),
             "tag": thread_id.map_or_else(|| "zedlink-test".to_owned(), |id| format!("zedlink-thread-{id}")),
             "thread_id": thread_id,
             "target_id": target_id,
-            "kind": if body == "A Zed Agent session needs your approval." { "approval" } else { "status" },
+            "kind": if approval { "approval" } else { "status" },
         });
         let encoded = match serde_json::to_vec(&payload) {
             Ok(encoded) => encoded,
@@ -1193,7 +1384,7 @@ impl Gateway {
         let mut builder = WebPushMessageBuilder::new(&record.subscription);
         builder.set_payload(ContentEncoding::Aes128Gcm, &encoded);
         builder.set_ttl(300);
-        builder.set_urgency(if body == "A Zed Agent session needs your approval." {
+        builder.set_urgency(if approval {
             Urgency::High
         } else {
             Urgency::Normal
@@ -1238,6 +1429,16 @@ impl Gateway {
         }
     }
 
+    async fn device_exists(&self, device_id: Uuid) -> bool {
+        self.0
+            .persisted
+            .lock()
+            .await
+            .devices
+            .iter()
+            .any(|device| device.id == device_id)
+    }
+
     async fn is_remote_thread(&self, target_id: &str, thread_id: &str) -> bool {
         self.0
             .persisted
@@ -1256,7 +1457,7 @@ impl Gateway {
             .is_some_and(|sent| sent.elapsed() < PHONE_SEND_WINDOW)
     }
 
-    async fn notify_all(&self, body: &'static str, target_id: &str, thread_id: &str) {
+    async fn notify_all(&self, message: &PushMessage) {
         let persisted = self.0.persisted.lock().await;
         let subscriptions = persisted.push_subscriptions.clone();
         let apns_devices = persisted.apns_devices.clone();
@@ -1265,8 +1466,7 @@ impl Gateway {
         let mut stale = HashSet::new();
         for record in subscriptions {
             if matches!(
-                self.send_push(&record, body, Some(thread_id), Some(target_id))
-                    .await,
+                self.send_push(&record, &message.body, Some(message)).await,
                 PushOutcome::Stale
             ) {
                 stale.insert(record.subscription.endpoint);
@@ -1286,13 +1486,7 @@ impl Gateway {
             for registration in apns_devices {
                 if matches!(
                     provider
-                        .send(
-                            &registration,
-                            body,
-                            &gateway_id,
-                            Some(target_id),
-                            Some(thread_id)
-                        )
+                        .send(&registration, &message.body, &gateway_id, Some(message))
                         .await,
                     PushOutcome::Stale
                 ) {
@@ -1353,9 +1547,11 @@ impl Gateway {
                         "version": 1,
                         "request_id": Uuid::new_v4().to_string(),
                         "method": "thread.snapshot",
-                        "params": {"thread_id": thread_id},
+                        // A short tail keeps the poll cheap and still holds the last reply.
+                        "params": {"thread_id": thread_id, "tail_entry_count": 8},
                     });
                     let key = format!("{}:{instance}:{epoch}:{thread_id}", target.id);
+                    let snapshot_result;
                     let (approvals, last_sequence, status, had_error) =
                         match self.probe(Some(&target.id), &snapshot_request).await {
                             Ok(snapshot) => {
@@ -1369,6 +1565,7 @@ impl Gateway {
                                     }
                                     continue;
                                 };
+                                snapshot_result = result.clone();
                                 (
                                     pending_approval_keys(result),
                                     result["last_sequence"].as_u64().unwrap_or(0),
@@ -1429,21 +1626,33 @@ impl Gateway {
                             && observation.status == "Generating"
                             && !self.phone_sent_recently(&target.id, thread_id).await;
                         if desktop_turn_started
-                            || events.is_some_and(|events| {
-                                has_local_user_message(events, last_sequence)
-                            })
+                            || events
+                                .is_some_and(|events| has_local_user_message(events, last_sequence))
                         {
                             self.set_remote_thread(&target.id, thread_id, false).await;
                         }
                     }
                     let initial = ThreadObservation::default();
-                    if let Some(body) = thread_notification(
+                    if let Some(event) = thread_notification(
                         prior.get(&key).unwrap_or(&initial),
                         &observation,
                         stop_reason.as_deref(),
                     ) && self.is_remote_thread(&target.id, thread_id).await
                     {
-                        self.notify_all(body, &target.id, thread_id).await;
+                        let (title, subtitle) = push_heading(thread, &snapshot_result);
+                        let message = PushMessage {
+                            title,
+                            subtitle,
+                            body: push_body(event, &snapshot_result),
+                            event,
+                            target_id: target.id.clone(),
+                            thread_id: thread_id.to_owned(),
+                            instance_id: instance.to_owned(),
+                            epoch: epoch.to_owned(),
+                            project_id: nonempty(&thread["project_id"]).map(str::to_owned),
+                            host_id: nonempty(&thread["host_id"]).map(str::to_owned),
+                        };
+                        self.notify_all(&message).await;
                     }
                     current.insert(key, observation);
                 }
@@ -1846,7 +2055,6 @@ async fn notification_test(
             &subscription,
             "Notifications are ready for this device.",
             None,
-            None,
         )
         .await
     {
@@ -1984,7 +2192,6 @@ async fn apns_test(State(state): State<Gateway>, headers: HeaderMap) -> impl Int
             "Native push is ready for this device.",
             &gateway_id,
             None,
-            None,
         )
         .await
     {
@@ -2043,6 +2250,10 @@ fn allowed_rpc_method(method: &str) -> bool {
             | "thread.approvals"
             | "approval.respond"
             | "project.files"
+            | "project.upload.begin"
+            | "project.upload.chunk"
+            | "project.upload.commit"
+            | "project.upload.abort"
             | "project.directory"
             | "project.file"
             | "project.search"
@@ -2426,7 +2637,7 @@ async fn event_stream(
 ) {
     let mut sequence = query.after_sequence.unwrap_or(0);
     let mut interval = tokio::time::interval(EVENT_POLL);
-    'stream: loop {
+    let reason: String = 'stream: loop {
         tokio::select! {
             biased;
             incoming = socket.recv() => match incoming {
@@ -2435,25 +2646,18 @@ async fn event_stream(
                         .await
                         .is_ok_and(|result| result.is_ok())
                     {
-                        break;
+                        break 'stream "pong failed".into();
                     }
                     continue;
                 }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(Message::Close(_))) | None => break 'stream "client closed".into(),
+                Some(Err(error)) => break 'stream format!("client error: {error}"),
                 Some(Ok(_)) => continue,
             },
             _ = interval.tick() => {}
         }
-        if !state
-            .0
-            .persisted
-            .lock()
-            .await
-            .devices
-            .iter()
-            .any(|device| device.id == device_id)
-        {
-            break;
+        if !state.device_exists(device_id).await {
+            break 'stream "device revoked".into();
         }
         let request = json!({"version":1,"request_id":Uuid::new_v4().to_string(),
             "method":"thread.events","params":{"thread_id":query.thread_id,"after_sequence":sequence}});
@@ -2467,10 +2671,11 @@ async fn event_stream(
                     Some(Ok(Message::Ping(payload))) => {
                         if !tokio::time::timeout(Duration::from_secs(5), socket.send(Message::Pong(payload)))
                             .await.is_ok_and(|result| result.is_ok()) {
-                            break 'stream;
+                            break 'stream "pong failed".into();
                         }
                     }
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break 'stream,
+                    Some(Ok(Message::Close(_))) | None => break 'stream "client closed".into(),
+                    Some(Err(error)) => break 'stream format!("client error: {error}"),
                     Some(Ok(_)) => {}
                 },
                 result = &mut probe => break result,
@@ -2481,34 +2686,38 @@ async fn event_stream(
             Err(_) => json!({"version":1,"error":{"code":"INSTANCE_UNAVAILABLE"}}),
         };
         // A device may be revoked while the native poll is in flight.
-        if !state
-            .0
-            .persisted
-            .lock()
-            .await
-            .devices
-            .iter()
-            .any(|device| device.id == device_id)
-        {
-            break;
+        if !state.device_exists(device_id).await {
+            break 'stream "device revoked".into();
         }
         if let Some(next) = response["result"]["last_sequence"].as_u64() {
             sequence = next;
         }
-        let stop = response.get("error").is_some();
+        let error_code = response
+            .get("error")
+            .map(|error| error["code"].as_str().unwrap_or("UNKNOWN").to_owned());
         if tokio::time::timeout(
             Duration::from_secs(5),
             socket.send(Message::Text(response.to_string().into())),
         )
         .await
         .map_or(true, |result| result.is_err())
-            || stop
         {
-            break;
+            break 'stream "send to client failed".into();
         }
-    }
+        if let Some(code) = error_code {
+            break 'stream format!("bridge error {code}");
+        }
+    };
+    let thread: String = query.thread_id.chars().take(8).collect();
+    eprintln!(
+        "event stream thread={thread} target={} after_sequence={sequence} closed: {reason}",
+        query.target_id.as_deref().unwrap_or("default")
+    );
     if let Err(error) = socket.close().await {
-        eprintln!("event stream close failed: {error}");
+        // The phone usually drops the socket first; that is not a gateway failure.
+        if !reason.starts_with("client") {
+            eprintln!("event stream close failed: {error}");
+        }
     }
 }
 
@@ -2677,12 +2886,12 @@ mod tests {
         assert_eq!(previous.approvals.len(), current.approvals.len());
         assert_eq!(
             thread_notification(&previous, &current, None),
-            Some("A Zed Agent session needs your approval.")
+            Some(NotificationEvent::Approval)
         );
         assert_eq!(thread_notification(&current, &current, None), None);
         assert_eq!(
             thread_notification(&ThreadObservation::default(), &current, None),
-            Some("A Zed Agent session needs your approval.")
+            Some(NotificationEvent::Approval)
         );
     }
 
@@ -2704,7 +2913,7 @@ mod tests {
         };
         assert_eq!(
             thread_notification(&generating, &failed, Some("error")),
-            Some("A Zed Agent session stopped with an error.")
+            Some(NotificationEvent::Error)
         );
         assert_eq!(thread_notification(&failed, &failed, None), None);
     }
@@ -2723,19 +2932,19 @@ mod tests {
         };
         assert_eq!(
             thread_notification(&running, &idle, Some("completed")),
-            Some("A Zed Agent session completed.")
+            Some(NotificationEvent::Done)
         );
         assert_eq!(
             thread_notification(&running, &idle, Some("cancelled")),
-            Some("A Zed Agent session was cancelled.")
+            Some(NotificationEvent::Stopped("отменено"))
         );
         assert_eq!(
             thread_notification(&running, &idle, Some("max_turn_requests")),
-            Some("A Zed Agent session reached its turn request limit.")
+            Some(NotificationEvent::Stopped("лимит запросов"))
         );
         assert_eq!(
             thread_notification(&running, &idle, None),
-            Some("A Zed Agent session stopped. Open it to review the result.")
+            Some(NotificationEvent::Done)
         );
         assert_eq!(thread_notification(&idle, &idle, None), None);
     }
@@ -2748,7 +2957,7 @@ mod tests {
         };
         assert_eq!(
             thread_notification(&ThreadObservation::default(), &waiting, None),
-            Some("A Zed Agent session needs your input.")
+            Some(NotificationEvent::Input)
         );
         assert_eq!(thread_notification(&waiting, &waiting, None), None);
     }
@@ -2780,5 +2989,75 @@ mod tests {
             {"sequence": 2, "kind": "entry.updated", "entry_kind": "user", "origin": "remote", "entry_index": 3},
         ]);
         assert!(!has_local_user_message(&relabelled, 2));
+    }
+
+    #[test]
+    fn push_text_names_thread_project_and_reply() {
+        let row = json!({"title": "Old title", "host_label": "hotbot2", "project": "dns",
+            "workspace_label": "infra-dns"});
+        let snapshot = json!({"title": "Настройки DNS", "entries_meta": [
+            {"kind": "assistant", "segments": [{"kind": "assistant", "text": "старый ответ"}]},
+            {"kind": "user"},
+            {"kind": "assistant", "segments": [
+                {"kind": "reasoning", "text": "думаю"},
+                {"kind": "assistant", "text": "Записи   обновлены,\nTTL 300."}]},
+            {"kind": "tool", "name": "edit"},
+        ]});
+        assert_eq!(
+            push_heading(&row, &snapshot),
+            (
+                "Настройки DNS".to_owned(),
+                Some("hotbot2 · infra-dns".to_owned())
+            )
+        );
+        assert_eq!(
+            push_body(NotificationEvent::Done, &snapshot),
+            "Готово: Записи обновлены, TTL 300."
+        );
+        let long = "я".repeat(300);
+        let reply = push_body(
+            NotificationEvent::Done,
+            &json!({"entries_meta": [{"kind": "assistant",
+                "segments": [{"kind": "assistant", "text": long}]}]}),
+        );
+        assert_eq!(
+            reply.chars().count(),
+            "Готово: ".chars().count() + PUSH_PREVIEW_CHARS + 1
+        );
+        assert_eq!(
+            push_body(
+                NotificationEvent::Approval,
+                &json!({"pending_approvals": [{"tool_name": "terminal"}]})
+            ),
+            "Нужно подтверждение: terminal"
+        );
+        assert_eq!(
+            push_heading(&json!({}), &json!({})),
+            ("ZLink".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn apns_payload_carries_routing_for_tap() {
+        let message = PushMessage {
+            title: "T".into(),
+            subtitle: Some("here · zed".into()),
+            body: "Готово".into(),
+            event: NotificationEvent::Done,
+            target_id: "desktop".into(),
+            thread_id: "t".repeat(80),
+            instance_id: "i1".into(),
+            epoch: "e1".into(),
+            project_id: Some("p1".into()),
+            host_id: None,
+        };
+        let payload = apns_payload(&message, "g1", 7);
+        assert_eq!(payload["type"], "push");
+        assert_eq!(payload["instance"], "i1");
+        assert_eq!(payload["epoch"], "e1");
+        assert_eq!(payload["project_id"], "p1");
+        assert_eq!(payload["aps"]["thread-id"], message.thread_id);
+        assert_eq!(payload["aps"]["alert"]["subtitle"], "here · zed");
+        assert_eq!(apns_collapse_id(&message).len(), 64);
     }
 }
