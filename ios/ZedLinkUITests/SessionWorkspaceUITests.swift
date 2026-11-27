@@ -19,7 +19,7 @@ final class SessionWorkspaceUITests: XCTestCase {
         XCTAssertTrue(row.waitForExistence(timeout: 20), "Disposable test thread is unavailable; verify pairing, route, and exposure.")
         row.tap()
         XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer").firstMatch.waitForExistence(timeout: 15))
-        XCTAssertFalse(app.tabBars.buttons["Connections"].exists)
+        XCTAssertFalse(app.tabBars.buttons["Сводка"].exists)
         XCTAssertFalse(app.tabBars.buttons["Settings"].exists)
         return app
     }
@@ -40,7 +40,7 @@ final class SessionWorkspaceUITests: XCTestCase {
         app.buttons["close-workspace"].tap()
         XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer").firstMatch.waitForExistence(timeout: 5))
         app.buttons["back-to-sessions"].tap()
-        XCTAssertTrue(app.tabBars.buttons["Connections"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.tabBars.buttons["Сводка"].waitForExistence(timeout: 5))
         let thread = ProcessInfo.processInfo.environment["ZEDLINK_E2E_THREAD_ID"]!
         XCTAssertTrue(app.buttons["thread-" + thread].waitForExistence(timeout: 5),
                       "Recently opened sessions must keep the same accessible entry point.")

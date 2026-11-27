@@ -70,4 +70,20 @@ import XCTest
         }
     }
 
+    func testGatewayPushOpensReviewWithoutTurnOrApproval() throws {
+        let suite = "notification-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let queue = NotificationResponseQueue(defaults: defaults, now: { 1000 })
+        // The APNs payload's routing fields; `created` arrives as a number and is stringified.
+        let data = ["type": "push", "event": "done", "gateway": "gateway", "target": "target", "thread": "thread",
+                    "instance": "instance", "epoch": "epoch", "created": "1000", "project_id": "p1", "host_id": "h1"]
+        queue.enqueue(id: "push", data: data, action: "com.apple.UNNotificationDefaultActionIdentifier")
+        let response = try XCTUnwrap(queue.claim())
+        XCTAssertEqual(response.action, "review")
+        XCTAssertEqual(response.data["project_id"], "p1")
+        // Older gateways send no instance or epoch; the tap still opens the thread.
+        queue.enqueue(id: "legacy-push", data: ["type": "push", "gateway": "gateway", "thread": "thread"], action: "approve")
+        XCTAssertEqual(queue.claim()?.action, "review")
+    }
 }

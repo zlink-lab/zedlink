@@ -41,6 +41,11 @@ import Network
     @Published private(set) var previewContent = ""
     @Published var contextPaths: Set<String> = []
     @Published var attachments: [PromptAttachment] = []
+    /// Files uploaded into the thread's project (`project.upload.*`), sent as `upload_refs`.
+    @Published private(set) var uploads: [ComposerUpload] = []
+    private var uploadTasks: [UUID: Task<Void, Never>] = [:]
+    /// The thread `thread.open` is reloading; `loadThreads` keeps it selected meanwhile.
+    @Published private(set) var recoveringThreadID: String?
     @Published private(set) var supportsImages: Bool?
     @Published private(set) var liveActivity = NativeAgentActivity.ready
     @Published private(set) var diffContent = ""
@@ -66,7 +71,18 @@ import Network
     var operationScope: [String] { [generation.uuidString, profile?.id.uuidString ?? "", targetID ?? "", instanceID ?? "", epoch ?? "", selectedThreadID ?? ""] }
     func clearIssue() { issue = ""; notificationNeedsWorkspace = false }
     func reportIssue(_ message: String) { issue = message }
+    var supportsUploads: Bool { capabilities.contains(ProjectUploader.capability) }
+
     func addImage(_ data: Data) {
+        if supportsUploads {
+            guard supportsImages != false else { issue = "The selected model does not support images."; return }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let stamp: String = formatter.string(from: Date())
+            addUpload(fileName: "photo-\(stamp).jpg", mimeType: "image/jpeg", data: data)
+            return
+        }
         guard capabilities.contains("thread.attachments"), supportsImages != false else { issue = "This thread or model does not support image attachments."; return }
         guard attachments.count + contextPaths.count < 8, data.count <= 1024 * 1024 else { issue = "Use at most eight attachments, each image up to 1 MiB."; return }
         attachments.append(PromptAttachment(name: "image-\(attachments.count + 1).jpg", mimeType: "image/jpeg", data: data))
@@ -78,6 +94,52 @@ import Network
         guard data.count <= 256 * 1024 else { issue = "Text files can be up to 256 KiB."; return }
         attachments.append(PromptAttachment(name: name, mimeType: mimeType, data: data))
     }
+    /// Uploads a phone file into the selected thread's project; the chip shows progress and the
+    /// committed `upload_ref` goes into the next `thread.send`.
+    func addUpload(fileName: String, mimeType: String?, data: Data) {
+        guard supportsUploads, let client, let instanceID, let epoch, let threadID = selectedThreadID else {
+            issue = "This Zed version does not accept file uploads from the phone."; return
+        }
+        guard uploads.count < ProjectUploader.maxRefsPerMessage else { issue = "A message can carry at most ten uploaded files."; return }
+        let file: PreparedUpload = ProjectUploader.prepare(fileName: fileName, mimeType: mimeType, data: data)
+        guard !file.data.isEmpty else { issue = "This file is empty."; return }
+        guard file.data.count <= ProjectUploader.maxBytes else { issue = "Files can be up to 25 MiB."; return }
+        let id = UUID()
+        uploads.append(ComposerUpload(id: id, name: file.fileName, mimeType: file.mimeType, size: file.data.count))
+        uploadTasks[id] = Task { [weak self] in
+            do {
+                let committed: CommittedUpload = try await ProjectUploader.upload(
+                    client: client, instanceID: instanceID, epoch: epoch, threadID: threadID, projectID: nil, file: file
+                ) { fraction in
+                    guard let self, let index = self.uploads.firstIndex(where: { $0.id == id }) else { return }
+                    self.uploads[index].progress = fraction
+                }
+                guard let self, let index = self.uploads.firstIndex(where: { $0.id == id }) else { return }
+                self.uploads[index].ref = committed.ref
+                self.uploads[index].progress = 1
+                self.uploadTasks[id] = nil
+            } catch {
+                guard let self else { return }
+                self.uploadTasks[id] = nil
+                guard !(error is CancellationError), let index = self.uploads.firstIndex(where: { $0.id == id }) else { return }
+                self.uploads[index].failure = ProjectUploader.describe(error)
+            }
+        }
+    }
+
+    /// Removes a chip; an upload still in progress is cancelled and aborted on the desktop.
+    func removeUpload(_ id: UUID) {
+        uploadTasks[id]?.cancel()
+        uploadTasks[id] = nil
+        uploads.removeAll { $0.id == id }
+    }
+
+    private func dropUploads() {
+        for task in uploadTasks.values { task.cancel() }
+        uploadTasks = [:]
+        uploads = []
+    }
+
     /// Adds a project file (project-relative path) to the next prompt.
     func addContextPath(_ path: String) {
         guard !contextPaths.contains(path) else { return }
@@ -130,7 +192,50 @@ import Network
         guard profile != nil else { return [] }
         let exposed = Set(threads.map(\.id))
         return threads + cachedConversations.filter { !exposed.contains($0.threadID) }
-            .map { NativeThread(id: $0.threadID, title: $0.title, status: "Saved copy", currentTurnID: nil) }
+            .map { cached -> NativeThread in
+                var thread = NativeThread(id: cached.threadID, title: cached.title, status: "Saved copy", currentTurnID: nil)
+                if let history = historyThread(cached.threadID) {
+                    thread.agentName = agentDisplayName(history.thread.agent)
+                    thread.hostID = history.hostID
+                    thread.projectID = history.projectID
+                    thread.hostLabel = history.hostLabel
+                    thread.workspaceLabel = history.project
+                } else { thread.agentName = "Agent" }
+                return thread
+            }
+    }
+
+    /// A history `agent` id such as `claude-acp` as the name `thread.create.options` gives it.
+    func agentDisplayName(_ raw: String) -> String {
+        createAgents.first(where: { $0.id == raw })?.name ?? raw
+    }
+
+    /// `host · workspace` for a thread: bridge labels first, then `workspace.list`, then the project name.
+    func placeLabel(for threadID: String) -> String? {
+        let thread: NativeThread? = threads.first(where: { $0.id == threadID })
+        let location: WorkspaceLocation? = thread.flatMap { workspaceLocation(for: $0) }
+        let history: RecentHistoryThread? = historyThread(threadID)
+        let host: String? = thread?.hostLabel ?? location?.host.label ?? history?.hostLabel
+        let workspace: String? = thread?.workspaceLabel ?? location?.project.name ?? history?.project ?? thread?.project
+        let parts: [String] = [host, workspace].compactMap { $0 }.filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    // MARK: Last-used agent (per connection and host)
+
+    private func lastAgentKey(hostID: String?) -> String? {
+        guard let profile else { return nil }
+        return "zedlink.lastAgent.\(profile.gatewayID.lowercased()).\(hostID ?? targetID ?? "default")"
+    }
+
+    func lastUsedAgent(hostID: String?) -> String? {
+        guard let key = lastAgentKey(hostID: hostID) else { return nil }
+        return UserDefaults.standard.string(forKey: key)
+    }
+
+    func rememberAgent(_ agentID: String, hostID: String?) {
+        guard let key = lastAgentKey(hostID: hostID) else { return }
+        UserDefaults.standard.set(agentID, forKey: key)
     }
     func cachedConversation(_ id: String) -> CachedConversation? {
         cachedConversations.first { $0.threadID == id }
@@ -146,6 +251,7 @@ import Network
         refreshingLive = false
         summaryCache = [:]
         attachments = []; diffContent = ""; diffLoading = false; workspaceLoading = false; supportsImages = nil
+        dropUploads(); recoveringThreadID = nil
         diffRequest = UUID(); workspaceRequest = UUID(); searchRequest = UUID()
         requestedTerminalID = nil
         generation = UUID()
@@ -210,6 +316,8 @@ import Network
         let previousScope = operationScope
         let previousAttachments = attachments
         let previousContextPaths = contextPaths
+        // Committed uploads stay valid in the same project; unfinished ones are cancelled.
+        let previousUploads: [ComposerUpload] = uploads.filter { $0.ref != nil }
         disconnect()
         if !sameProfile { draft = "" }
         let current = generation
@@ -259,7 +367,7 @@ import Network
                                           rememberedThread: rememberedThread, previousPending: previousPending,
                                           previousTarget: previousTarget, previousScope: previousScope,
                                           previousAttachments: previousAttachments, previousContextPaths: previousContextPaths,
-                                          current: current)
+                                          previousUploads: previousUploads, current: current)
                     return
                 } catch GatewayFailure.native("UNSUPPORTED_CAPABILITY"), GatewayFailure.native("UNKNOWN_TARGET") {
                     // Older gateways use the established discovery and snapshot flow.
@@ -337,9 +445,14 @@ import Network
                 if Array(operationScope.dropFirst(2)) == Array(previousScope.dropFirst(2)) {
                     attachments = previousAttachments
                     contextPaths = previousContextPaths
+                    uploads = previousUploads
                 }
-                try await loadSnapshot(rememberedThread, refreshAuxiliary: false)
-                resumeTrace?.mark("Native snapshot ready")
+                do {
+                    try await loadSnapshot(rememberedThread, refreshAuxiliary: false)
+                    resumeTrace?.mark("Native snapshot ready")
+                } catch let failure as GatewayFailure where failure.isThreadNotLoaded {
+                    // Zed restarted: the thread is in history but not loaded. Recovered once live.
+                }
             }
             guard current == generation else { return }
             state = .live
@@ -353,7 +466,7 @@ import Network
                 await self.pollLoop(current)
             }
             startEventStream(current)
-            if let rememberedThread { Task { [weak self] in await self?.refreshAuxiliaryAfterResume(rememberedThread, current: current) } }
+            if let rememberedThread { Task { [weak self] in await self?.restoreRememberedThread(rememberedThread, current: current) } }
             Task { [weak self] in await self?.syncAPNs() }
         } catch {
             guard current == generation else { return }
@@ -391,7 +504,8 @@ import Network
     private func applyResume(_ result: [String: Any], profile: ConnectionProfile, token: String, targetID resumedTarget: String,
                              rememberedThread: String?, previousPending: PendingSend?, previousTarget: String?,
                              previousScope: [String], previousAttachments: [PromptAttachment],
-                             previousContextPaths: Set<String>, current: UUID) async throws {
+                             previousContextPaths: Set<String>, previousUploads: [ComposerUpload] = [],
+                             current: UUID) async throws {
         guard let instance = result["instance_id"] as? String,
               let nextEpoch = result["epoch"] as? String,
               let target = result["target"] as? [String: Any],
@@ -426,10 +540,15 @@ import Network
             if Array(operationScope.dropFirst(2)) == Array(previousScope.dropFirst(2)) {
                 attachments = previousAttachments
                 contextPaths = previousContextPaths
+                uploads = previousUploads
             }
-            try await loadSnapshot(rememberedThread, refreshAuxiliary: false,
-                                   prefetched: result["snapshot"] as? [String: Any])
-            resumeTrace?.mark("Native snapshot ready")
+            do {
+                try await loadSnapshot(rememberedThread, refreshAuxiliary: false,
+                                       prefetched: result["snapshot"] as? [String: Any])
+                resumeTrace?.mark("Native snapshot ready")
+            } catch let failure as GatewayFailure where failure.isThreadNotLoaded {
+                // Zed restarted: the thread is in history but not loaded. Recovered once live.
+            }
         }
         guard current == generation else { return }
         state = .live
@@ -442,7 +561,7 @@ import Network
             await self.pollLoop(current)
         }
         startEventStream(current)
-        if let rememberedThread { Task { [weak self] in await self?.refreshAuxiliaryAfterResume(rememberedThread, current: current) } }
+        if let rememberedThread { Task { [weak self] in await self?.restoreRememberedThread(rememberedThread, current: current) } }
         Task { [weak self] in await self?.refreshTargets(current: current) }
         Task { [weak self] in await self?.syncAPNs() }
     }
@@ -487,6 +606,108 @@ import Network
     func testAPNs() async throws {
         guard state == .live, let client else { throw GatewayFailure.native("Reconnect to test native push.") }
         try await client.testAPNs()
+    }
+
+    /// After a resume: refreshes controls for a loaded thread, or reopens a thread that Zed knows
+    /// from history but has not loaded (for example after a Zed restart) and selects it again.
+    private func restoreRememberedThread(_ id: String, current: UUID) async {
+        guard current == generation, state == .live else { return }
+        let listed: Bool = threads.contains(where: { $0.id == id })
+        if listed && snapshot?.threadID == id {
+            await refreshAuxiliaryAfterResume(id, current: current)
+            return
+        }
+        guard capabilities.contains("thread.open") else { return }
+        if !listed {
+            if supportsWorkspaces && workspaceHosts.isEmpty { await loadWorkspaces() }
+            guard current == generation, historyThread(id) != nil || cachedConversation(id) != nil else { return }
+        }
+        guard await recoverThread(id), current == generation else { return }
+        if issue == threadExposureIssue { issue = "" }
+        await select(id)
+    }
+
+    /// The `workspace.list` history row for a thread id, when desktop Zed reported one.
+    func historyThread(_ id: String) -> RecentHistoryThread? {
+        for host in workspaceHosts {
+            for project in host.projects {
+                if let thread = project.threads.first(where: { $0.id == id }) {
+                    return RecentHistoryThread(thread: thread, project: project.name, host: host.isSSH ? host.label : nil,
+                                               hostID: host.id, projectID: project.id, hostLabel: host.label)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Error text with the native code, so a failure the app cannot recover from is identifiable.
+    static func failureText(_ error: Error) -> String {
+        let text: String = error.localizedDescription
+        if case GatewayFailure.native(let code) = error, !text.contains(code),
+           code.allSatisfy({ $0.isUppercase || $0 == "_" }) {
+            return text + " (" + code + ")"
+        }
+        return text
+    }
+
+    /// `thread.open` for a thread Zed knows but has not loaded (`THREAD_NOT_LOADED`, or
+    /// `THREAD_NOT_EXPOSED` after a restart), then waits until `thread.list` lists it.
+    /// A second caller for the same thread waits for the first instead of reopening it.
+    @discardableResult
+    func recoverThread(_ id: String) async -> Bool {
+        if recoveringThreadID == id {
+            for _ in 0..<120 where recoveringThreadID == id {
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+            return threads.contains(where: { $0.id == id })
+        }
+        guard capabilities.contains("thread.open"), let client, recoveringThreadID == nil else { return false }
+        let scope = workspaceScope
+        recoveringThreadID = id
+        defer { if recoveringThreadID == id { recoveringThreadID = nil } }
+        do {
+            let result = try await client.rpc("thread.open", params: workspaceParams(["thread_id": id]))
+            guard let outcome = result["outcome"] as? String, outcome == "loading" || outcome == "loaded" else {
+                throw GatewayFailure.invalidResponse
+            }
+            for attempt in 0..<60 {
+                if attempt > 0 { try await Task.sleep(for: .seconds(1)) }
+                guard scope == workspaceScope else { return false }
+                try await loadThreads(includeSummaries: false)
+                guard scope == workspaceScope else { return false }
+                if threads.contains(where: { $0.id == id }) {
+                    // A reloaded thread restarts its event sequence; the old page must not block it.
+                    if selectedThreadID == id { snapshot = nil; lastSnapshotAt = nil }
+                    return true
+                }
+            }
+            throw GatewayFailure.native("Zed has not loaded this thread yet. Check desktop Zed, then try again. (THREAD_NOT_LOADED)")
+        } catch {
+            if scope == workspaceScope && !isCancelledRequest(error) {
+                issue = "Could not reopen the thread in Zed: " + Self.failureText(error)
+            }
+            return false
+        }
+    }
+
+    /// `loadSnapshot`, reopening the thread once when Zed reports it is not loaded.
+    private func loadSnapshotRecovering(_ id: String) async throws {
+        do {
+            try await loadSnapshot(id, refreshAuxiliary: false)
+        } catch let failure as GatewayFailure where failure.isThreadNotLoaded {
+            guard capabilities.contains("thread.open"), await recoverThread(id) else { throw failure }
+            var last: Error = failure
+            for attempt in 0..<15 {
+                if attempt > 0 { try await Task.sleep(for: .seconds(1)) }
+                do {
+                    try await loadSnapshot(id, refreshAuxiliary: false)
+                    return
+                } catch let next as GatewayFailure where next.isThreadNotLoaded {
+                    last = next
+                }
+            }
+            throw last
+        }
     }
 
     private func refreshAuxiliaryAfterResume(_ id: String, current: UUID) async {
@@ -692,6 +913,7 @@ import Network
             for _ in 0..<40 {
                 let result = try await client.rpc("thread.create", params: params, requestID: requestID)
                 if result["outcome"] as? String == "ready", let id = result["thread_id"] as? String {
+                    rememberAgent(agentID, hostID: location?.host.id)
                     try await loadThreads()
                     await select(id)
                     if selectedThreadID == id {
@@ -795,11 +1017,16 @@ import Network
                                 currentTurnID: row["current_turn_id"] as? Int)
             thread.activity = NativeAgentActivity(row["activity"], status: thread.status, currentTurnID: thread.currentTurnID)
             let agent: [String: Any]? = row["agent"] as? [String: Any]
-            thread.agentName = agent?["name"] as? String ?? "Zed Agent"
+            // Older bridges omit `agent`; the history row names the real one (e.g. Claude Code).
+            let reportedAgent: String? = (agent?["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let historyAgent: String? = reportedAgent == nil ? historyThread(id).map { agentDisplayName($0.thread.agent) } : nil
+            thread.agentName = reportedAgent ?? historyAgent ?? "Zed Agent"
             thread.agentID = (agent?["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             thread.hostID = (row["host_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             thread.projectID = (row["project_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             thread.workspacePaths = (row["workspace_paths"] as? [String] ?? []).filter { !$0.isEmpty }
+            thread.hostLabel = (row["host_label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            thread.workspaceLabel = (row["workspace_label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             thread.retrying = row["retry_status"] is [String: Any]
             thread.failed = row["had_error"] as? Bool == true || row["agent_error"] is [String: Any]
             let project: String = (row["project"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -833,7 +1060,7 @@ import Network
         }
         guard scope == operationScope else { return }
         threads = loaded
-        if let selectedThreadID, !threads.contains(where: { $0.id == selectedThreadID }) {
+        if let selectedThreadID, selectedThreadID != recoveringThreadID, !threads.contains(where: { $0.id == selectedThreadID }) {
             self.selectedThreadID = nil
             snapshot = nil
             lastSnapshotAt = nil
@@ -847,9 +1074,13 @@ import Network
 
     func select(_ id: String) async {
         localExposureStopped = false
-        guard threads.contains(where: { $0.id == id }) else { return }
+        if !threads.contains(where: { $0.id == id }) {
+            // Known from history or a saved copy, but not loaded in Zed: load it first.
+            guard state == .live, await recoverThread(id) else { return }
+        }
         if selectedThreadID != id {
             childHistory.removeAll()
+            dropUploads()
             selectedThreadID = id
             if let profile, let targetID {
                 UserDefaults.standard.set(id, forKey: selectedThreadKey(profile, targetID: targetID))
@@ -872,7 +1103,7 @@ import Network
         }
         let scope = operationScope
         do {
-            try await loadSnapshot(id, refreshAuxiliary: false)
+            try await loadSnapshotRecovering(id)
             guard scope == operationScope else { return }
             issue = ""
             startEventStream(generation)
@@ -881,7 +1112,7 @@ import Network
         }
         catch {
             guard scope == operationScope else { return }
-            if !isCancelledRequest(error) { issue = "Conversation could not refresh: \(error.localizedDescription)" }
+            if !isCancelledRequest(error) { issue = "Conversation could not refresh: " + Self.failureText(error) }
         }
     }
 
@@ -929,6 +1160,11 @@ import Network
                         snapshot = nil
                         do { try await loadSnapshot(threadID) }
                         catch { if current == generation { issue = error.localizedDescription; state = .stale } }
+                    } else if let failure = error as? GatewayFailure, failure.isThreadNotLoaded,
+                              capabilities.contains("thread.open") {
+                        // Zed unloaded the thread (restart, or exposed but not loaded): reopen it,
+                        // then the next stream starts from a fresh snapshot.
+                        if await recoverThread(threadID) { delay = 1; continue }
                     }
                     try? await Task.sleep(for: .seconds(delay))
                     delay = min(10, delay * 2)
@@ -1107,6 +1343,12 @@ import Network
             ?? threads.first(where: { $0.id == id })?.title ?? "Untitled Agent thread"
         let nativeStatus = result["status"] as? String ?? "Unknown"
         let nativeTurnID = result["current_turn_id"] as? Int
+        if let index = threads.firstIndex(where: { $0.id == id }) {
+            let hostLabel: String? = (result["host_label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            let workspaceLabel: String? = (result["workspace_label"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            if let hostLabel, threads[index].hostLabel != hostLabel { threads[index].hostLabel = hostLabel }
+            if let workspaceLabel, threads[index].workspaceLabel != workspaceLabel { threads[index].workspaceLabel = workspaceLabel }
+        }
         let nextActivity = NativeAgentActivity(result["activity"], status: nativeStatus, currentTurnID: nativeTurnID)
         if liveActivity != nextActivity { liveActivity = nextActivity }
         if let index = threads.firstIndex(where: { $0.id == id }), threads[index].activity != nextActivity {
@@ -1735,6 +1977,8 @@ import Network
     /// Hosts from the last `workspace.list`, only while the same gateway, target and Zed instance are current.
     var workspaceHosts: [WorkspaceHost] { storedWorkspaceScope == workspaceScope ? storedWorkspaceHosts : [] }
     var supportsWorkspaces: Bool { capabilities.contains("workspace.list") }
+    /// Hosts worth showing: SSH connections Zed saved without any project (bare IPs) are hidden.
+    var visibleWorkspaceHosts: [WorkspaceHost] { workspaceHosts.filter { !$0.isSSH || !$0.projects.isEmpty } }
     var supportsRecentHistory: Bool { supportsWorkspaces && capabilities.contains("thread.open") }
 
     private var workspaceScope: [String] {
@@ -2090,6 +2334,17 @@ import Network
                     snapshot = nil
                     do { try await loadSnapshot(id); state = .live }
                     catch { state = .stale; issue = error.localizedDescription }
+                } else if let failure = error as? GatewayFailure, failure.isThreadNotLoaded,
+                          let id = selectedThreadID, capabilities.contains("thread.open"),
+                          await recoverThread(id) {
+                    guard current == generation else { break }
+                    do {
+                        try await loadSnapshotRecovering(id)
+                        state = .live
+                        if issue != threadExposureIssue { issue = "" }
+                    } catch {
+                        if current == generation { issue = "Conversation could not refresh: " + Self.failureText(error) }
+                    }
                 } else if case GatewayFailure.native("THREAD_NOT_EXPOSED") = error {
                     guard current == generation else { break }
                     selectedThreadID = nil
@@ -2139,28 +2394,22 @@ import Network
         }
     }
 
-    func handleApprovalNotification(_ data: [String: String], action: String) async {
+    func handleApprovalNotification(_ data: [String: String], action: String, profiles: [ConnectionProfile] = []) async {
         // Foreground refresh can overlap an alert opened during connection restoration.
         for _ in 0..<80 {
             guard state == .connecting else { break }
             do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
         }
         guard state != .connecting else { issue = "Connection is still restoring. Open the session to review current requests."; return }
-        if state != .live { await refresh() }
-        guard state == .live else { issue = "Reconnect before reviewing this notification."; return }
         if data["type"] == "push_test" { return }
-        if data["type"] == "push" {
-            guard data["gateway"]?.caseInsensitiveCompare(profile?.gatewayID ?? "") == .orderedSame,
-                  data["target"] == targetID,
-                  let thread = data["thread"], threads.contains(where: { $0.id == thread }) else {
-                issue = "Choose the notification's paired workspace, then refresh to review its current state."
-                notificationNeedsWorkspace = true
-                return
-            }
-            if notificationNeedsWorkspace { clearIssue() }
-            notificationThreadID = thread
+        if data["type"] == "push", let gateway = data["gateway"], let thread = data["thread"] {
+            // Gateway pushes name the connection, workspace and thread; open it wherever it lives.
+            _ = await openThread(gatewayID: gateway, targetID: data["target"], threadID: thread,
+                                 hostID: data["host_id"], projectID: data["project_id"], profiles: profiles)
             return
         }
+        if state != .live { await refresh() }
+        guard state == .live else { issue = "Reconnect before reviewing this notification."; return }
         guard data["gateway"] == profile?.gatewayID, data["target"] == targetID,
               data["instance"] == instanceID, data["epoch"] == epoch,
               let thread = data["thread"], threads.contains(where: { $0.id == thread }) else {
@@ -2185,6 +2434,50 @@ import Network
             return
         }
         await respond(to: approval, with: decision)
+    }
+
+    /// Switches to the saved connection for `gatewayID` (and Zed target), narrows the sessions list
+    /// to the thread's workspace, loads the thread in Zed if needed and opens its conversation.
+    /// Used by push taps and the Summary tab.
+    func openThread(gatewayID: String, targetID requestedTarget: String?, threadID: String,
+                    hostID: String?, projectID: String?, profiles: [ConnectionProfile]) async -> Bool {
+        let target: String? = requestedTarget.flatMap { $0.isEmpty ? nil : $0 }
+        let sameGateway: Bool = profile?.gatewayID.caseInsensitiveCompare(gatewayID) == .orderedSame
+        if !sameGateway || (target != nil && target != targetID) || state != .live {
+            let candidate: ConnectionProfile? = sameGateway ? profile
+                : profiles.first(where: { $0.gatewayID.caseInsensitiveCompare(gatewayID) == .orderedSame })
+            guard let candidate else {
+                issue = "This thread belongs to a connection that is not saved on this iPhone."
+                notificationNeedsWorkspace = true
+                return false
+            }
+            if sameGateway && (target == nil || target == targetID) { await refresh() }
+            else { await connect(candidate, target: target) }
+        }
+        guard state == .live else {
+            if issue.isEmpty { issue = "Reconnect before opening this thread." }
+            return false
+        }
+        if supportsWorkspaces && workspaceHosts.isEmpty { await loadWorkspaces() }
+        var hostRow: WorkspaceHost? = nil
+        if let hostID { hostRow = workspaceHosts.first(where: { $0.id == hostID }) }
+        if hostRow == nil, let projectID {
+            hostRow = workspaceHosts.first(where: { host in host.projects.contains(where: { $0.id == projectID }) })
+        }
+        if let hostRow {
+            let project: WorkspaceProject? = projectID.flatMap { id in hostRow.projects.first(where: { $0.id == id }) }
+            setWorkspaceFilter(WorkspaceFilter(hostID: hostRow.id, hostLabel: hostRow.label,
+                                               projectID: project?.id, projectName: project?.name))
+        } else if let filter = workspaceFilter, let thread = threads.first(where: { $0.id == threadID }),
+                  !filter.matches(thread, in: workspaceHosts) {
+            setWorkspaceFilter(nil)
+        }
+        if !threads.contains(where: { $0.id == threadID }) {
+            guard await recoverThread(threadID) else { notificationNeedsWorkspace = true; return false }
+        }
+        if notificationNeedsWorkspace { clearIssue() }
+        notificationThreadID = threadID
+        return true
     }
 
     func respond(to approval: NativeApproval, with decision: NativeApprovalDecision) async {
@@ -2226,14 +2519,16 @@ import Network
         guard canSend, let client, let profile, let instanceID, let epoch,
               let threadID = selectedThreadID else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || !attachments.isEmpty || !contextPaths.isEmpty else { return }
+        guard !uploads.contains(where: \.isUploading) else { issue = "Wait for the uploads to finish, or remove them."; return }
+        let uploadRefs: [String] = uploads.compactMap(\.ref)
+        guard !text.isEmpty || !attachments.isEmpty || !contextPaths.isEmpty || !uploadRefs.isEmpty else { return }
         if let command = commands.first(where: { "/" + $0.name == text && $0.execution == "local" }) {
-            guard attachments.isEmpty, contextPaths.isEmpty else { issue = "Run local commands without attachments."; return }
+            guard attachments.isEmpty, contextPaths.isEmpty, uploadRefs.isEmpty else { issue = "Run local commands without attachments."; return }
             if !localConfirmed { localCommandScope = operationScope; localCommandText = text; localCommandConfirmation = command; return }
         }
         guard attachments.count + contextPaths.count <= 8 else { issue = "A prompt can include at most eight attachments."; return }
         guard !attachments.contains(where: \.isImage) || supportsImages != false else { issue = "The selected model does not support images. Remove the image or select a supported model."; return }
-        if !attachments.isEmpty || !contextPaths.isEmpty {
+        if !attachments.isEmpty || !contextPaths.isEmpty || !uploadRefs.isEmpty {
             let command = text.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
             if commands.contains(where: { "/" + $0.name == command && $0.category == "native" }) {
                 issue = "Send attachments with a normal prompt; run the native slash command separately."; return
@@ -2242,6 +2537,7 @@ import Network
         pending = PendingSend(id: UUID().uuidString, instanceID: instanceID,
                               epoch: epoch, threadID: threadID, text: text, contextPaths: Array(contextPaths), attachments: attachments)
         pending?.localConfirmed = localConfirmed ? true : nil
+        pending?.uploadRefs = uploadRefs
         persistPending(for: profile)
         delivery = "Sending to native Zed…"
         await retryPending()
@@ -2259,6 +2555,8 @@ import Network
             contextPaths.subtract(pending.contextPaths)
             let sentImages = Set(pending.attachments.map(\.id))
             attachments.removeAll { sentImages.contains($0.id) }
+            let sentRefs = Set(pending.uploadRefs)
+            uploads.removeAll { upload in upload.ref.map { sentRefs.contains($0) } ?? false }
             settlePending()
             delivery = outcome == "queued"
                 ? "Queued in desktop Zed. Native execution is being observed."

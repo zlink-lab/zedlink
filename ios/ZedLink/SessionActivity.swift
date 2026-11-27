@@ -16,7 +16,8 @@ enum SessionActivity: String, CaseIterable {
     }
     var attention: Bool { [.approval, .input, .failed].contains(self) }
     var running: Bool { [.compacting, .generating, .retrying].contains(self) }
-    var group: String { attention ? "Needs attention" : running ? "Running" : "Ready & other" }
+    /// Idle and saved threads have no group; they are listed under "Recent in Zed" / "История".
+    var group: String? { attention ? "Needs attention" : running ? "Running" : nil }
 }
 
 @MainActor final class SessionLibrary: ObservableObject {

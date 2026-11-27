@@ -92,3 +92,32 @@ struct SectionLabel: View {
             .foregroundStyle(ZLTheme.muted)
     }
 }
+
+/// Where a thread lives: a host letter badge plus the workspace name ("H  zedlink").
+struct PlaceBadge: View {
+    let host: String?
+    let workspace: String?
+
+    private var letter: String {
+        guard let host, let first = host.first(where: { $0.isLetter || $0.isNumber }) else { return "?" }
+        return String(first).uppercased()
+    }
+
+    var body: some View {
+        if host != nil || workspace != nil {
+            HStack(spacing: 5) {
+                if host != nil {
+                    Text(letter)
+                        .font(.caption2.weight(.bold).monospaced())
+                        .foregroundStyle(ZLTheme.background)
+                        .frame(width: 16, height: 16)
+                        .background(ZLTheme.muted, in: RoundedRectangle(cornerRadius: 4))
+                }
+                Text([host, workspace].compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption2).foregroundStyle(ZLTheme.muted).lineLimit(1)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel([host, workspace].compactMap { $0 }.joined(separator: ", "))
+        }
+    }
+}

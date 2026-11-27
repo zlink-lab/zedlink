@@ -25,10 +25,14 @@ import Foundation
     }
     func enqueue(id: String, data: [String: String], action: String) {
         prune()
-        let reviewOnly = ["agent_error", "turn_status", "compaction", "input_needed"].contains(data["type"] ?? "")
-        let required = ["gateway", "target", "instance", "epoch", "thread"] + (reviewOnly ? [] : ["turn", "approval", "child"])
+        // Gateway pushes (`push`) only open their thread, like the local review-only alerts. Their
+        // instance/epoch may be stale after a Zed restart, so only the routing fields are required.
+        let gatewayPush = ["push", "push_test"].contains(data["type"] ?? "")
+        let reviewOnly = gatewayPush || ["agent_error", "turn_status", "compaction", "input_needed"].contains(data["type"] ?? "")
+        let required = gatewayPush ? ["gateway", "thread"]
+            : ["gateway", "target", "instance", "epoch", "thread"] + (reviewOnly ? [] : ["turn", "approval", "child"])
         guard id.utf8.count <= 2048, required.allSatisfy({ data[$0] != nil }),
-              data.count <= 12, data.values.allSatisfy({ $0.utf8.count <= 2048 }),
+              data.count <= 16, data.values.allSatisfy({ $0.utf8.count <= 2048 }),
               state.consumed[id] == nil, !state.pending.contains(where: { $0.id == id }) else { return }
         let created = data["created"].flatMap { TimeInterval($0) } ?? now()
         guard created.isFinite, now() - created >= 0, now() - created <= lifetime else { return }

@@ -330,7 +330,10 @@ final class ZedLinkAPNsDelegate: NSObject, UIApplicationDelegate {
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                            withCompletionHandler completionHandler: @escaping () -> Void) {
         let data = response.notification.request.content.userInfo.reduce(into: [String: String]()) { result, pair in
-            if let key = pair.key as? String, let value = pair.value as? String { result[key] = value }
+            // APNs payloads carry `created` as a number; `aps` and null fields are skipped.
+            guard let key = pair.key as? String else { return }
+            if let value = pair.value as? String { result[key] = value }
+            else if let value = pair.value as? NSNumber { result[key] = value.stringValue }
         }
         Task { @MainActor in
             if response.actionIdentifier != UNNotificationDismissActionIdentifier {

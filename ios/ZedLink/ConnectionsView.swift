@@ -32,11 +32,16 @@ struct ConnectionsView: View {
     @State private var checks: [ConnectionCheck] = []
     @State private var checkedThreads: [String] = []
     @Binding var draft: ConnectionDraft
+    /// True inside Settings' navigation stack; false keeps its own stack.
+    var embedded = false
     private var currentProfile: ConnectionProfile? { session.profile ?? profiles.preferredProfile }
     private var currentIsLive: Bool { session.state == .live && session.profile?.id == currentProfile?.id }
 
     var body: some View {
-        NavigationStack {
+        if embedded { connectionsList } else { NavigationStack { connectionsList } }
+    }
+
+    private var connectionsList: some View {
             List {
                 Section("Saved connections") {
                     if profiles.profiles.isEmpty {
@@ -188,7 +193,6 @@ struct ConnectionsView: View {
                 .sheet(isPresented: $showingAdd) { AddConnectionView(draft: $draft) }
                 .onChange(of: currentProfile) { _, _ in resetChecks() }
                 .onChange(of: session.targetID) { _, _ in resetChecks() }
-        }
     }
 
     private func pathRow(_ title: String, checkID: String, liveDetail: String,
@@ -541,7 +545,11 @@ struct AddConnectionView: View {
             }
             .navigationTitle(draft.editing ? "Edit connection" : "Add connection").navigationBarTitleDisplayMode(.inline)
             .interactiveDismissDisabled(busy)
-            .onChange(of: endpoint) { _, _ in observedID = "" }
+            .onChange(of: endpoint) { _, value in
+                observedID = ""
+                // A LAN address is not Tailscale: only 100.64.0.0/10 and *.ts.net are.
+                if let detected = RouteKind.detect(endpoint: value), detected != route { route = detected }
+            }
             .onChange(of: expectedID) { _, _ in
                 if !observedID.isEmpty { issue = identityIssue }
             }
@@ -589,6 +597,7 @@ struct AddConnectionView: View {
         endpointParts.fragment = nil
         guard let address = endpointParts.url?.absoluteString else { issue = "The pairing address is invalid."; return }
         endpoint = address
+        if let detected = RouteKind.detect(endpoint: address) { route = detected }
         expectedID = gatewayID
         code = query.first(where: { $0.name == "pair" })?.value ?? ""
         observedID = ""

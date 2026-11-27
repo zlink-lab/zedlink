@@ -19,6 +19,12 @@ enum GatewayFailure: LocalizedError {
         ].contains(message)
     }
 
+    /// The thread exists but Zed has not loaded it (for example after a restart); `thread.open` recovers it.
+    var isThreadNotLoaded: Bool {
+        guard case .native(let code) = self else { return false }
+        return code == "THREAD_NOT_LOADED" || code == "THREAD_NOT_EXPOSED"
+    }
+
     var errorDescription: String? {
         switch self {
         case .invalidEndpoint: "Enter a valid HTTPS address without credentials, query, or fragment."
@@ -30,6 +36,8 @@ enum GatewayFailure: LocalizedError {
             switch code {
             case "UNAUTHENTICATED": "Device pairing is missing or revoked."
             case "THREAD_NOT_EXPOSED": "This thread is no longer exposed in desktop Zed."
+            case "THREAD_NOT_LOADED": "Desktop Zed has not loaded this thread (THREAD_NOT_LOADED)."
+            case "FILE_TOO_LARGE": "Files can be up to 25 MiB (FILE_TOO_LARGE)."
             case "INSTANCE_UNAVAILABLE": "Desktop Zed is unavailable."
             case "RESYNC_REQUIRED": "Event history changed; refreshing the native snapshot."
             case "HOST_UNAVAILABLE": "Zed could not connect to that host. Check desktop Zed for a password prompt or error."

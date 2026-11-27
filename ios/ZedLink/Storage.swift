@@ -1,72 +1,5 @@
 import Foundation
-import Security
 import Combine
-
-actor CredentialVault {
-    static let shared = CredentialVault()
-    private let service = "dev.zedlink.gateway"
-
-    private func read(account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    private func gatewayAccount(_ gatewayID: String) -> String {
-        "gateway:\(gatewayID.lowercased())"
-    }
-
-    /// Credentials follow the gateway identity, rather than a route or profile UUID.
-    /// The UUID fallback migrates credentials written by ZedLink 1.x in place.
-    func read(_ profile: ConnectionProfile) -> String? {
-        let account = gatewayAccount(profile.gatewayID)
-        if let token = read(account: account) { return token }
-        guard let legacy = read(account: profile.id.uuidString) else { return nil }
-        do {
-            try write(legacy, for: profile)
-            delete(account: profile.id.uuidString)
-        } catch { /* Keep the legacy entry if migration cannot be committed. */ }
-        return legacy
-    }
-
-    func write(_ token: String, for profile: ConnectionProfile) throws {
-        let account = gatewayAccount(profile.gatewayID)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        SecItemDelete(query as CFDictionary)
-        var add = query
-        add[kSecValueData as String] = Data(token.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else {
-            throw GatewayFailure.native("Could not save the device credential in Keychain.")
-        }
-    }
-
-    private func delete(account: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        SecItemDelete(query as CFDictionary)
-    }
-
-    func delete(_ profile: ConnectionProfile) {
-        delete(account: gatewayAccount(profile.gatewayID))
-        delete(account: profile.id.uuidString)
-    }
-}
 
 @MainActor final class ProfileStore: ObservableObject {
     @Published private(set) var profiles: [ConnectionProfile] = []
@@ -76,8 +9,24 @@ actor CredentialVault {
     init() {
         if let data = UserDefaults.standard.data(forKey: key),
            let profiles = try? JSONDecoder().decode([ConnectionProfile].self, from: data) {
-            self.profiles = profiles
+            self.profiles = Self.migratedRoutes(profiles)
         }
+        publishShared()
+    }
+
+    /// Profiles saved before route detection existed defaulted to Tailscale, even for LAN addresses.
+    nonisolated static func migratedRoutes(_ profiles: [ConnectionProfile]) -> [ConnectionProfile] {
+        profiles.map { profile in
+            guard profile.route == .tailscale, let detected = RouteKind.detect(endpoint: profile.endpoint),
+                  detected != .tailscale else { return profile }
+            var fixed = profile
+            fixed.route = detected
+            return fixed
+        }
+    }
+
+    private func publishShared() {
+        SharedProfiles.publish(profiles, lastUsed: UserDefaults.standard.string(forKey: lastProfileKey))
     }
 
     @discardableResult
@@ -113,6 +62,7 @@ actor CredentialVault {
 
     func markUsed(_ profile: ConnectionProfile) {
         UserDefaults.standard.set(profile.id.uuidString, forKey: lastProfileKey)
+        publishShared()
     }
 
     func remove(_ profile: ConnectionProfile) async {
@@ -135,5 +85,6 @@ actor CredentialVault {
         if let data = try? JSONEncoder().encode(profiles) {
             UserDefaults.standard.set(data, forKey: key)
         }
+        publishShared()
     }
 }

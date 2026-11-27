@@ -6,11 +6,13 @@ import SwiftUI
     @StateObject private var library = SessionLibrary()
     @StateObject private var profiles = ProfileStore()
     @StateObject private var session = SessionManager()
+    @StateObject private var summary = SummaryStore()
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("zedlink.appearance") private var appearance = "dark"
     @State private var selectedTab = 0
     @State private var sessionsPath: [String] = []
     @State private var connectionDraft = ConnectionDraft()
+    @State private var showingConnections = false
 
     private var preferredColorScheme: ColorScheme? {
         switch appearance {
@@ -25,21 +27,27 @@ import SwiftUI
             TabView(selection: $selectedTab) {
                 SessionsView(navigationPath: $sessionsPath)
                     .tabItem { Label("Sessions", systemImage: "bubble.left.and.bubble.right") }.tag(0)
-                ConnectionsView(draft: $connectionDraft)
-                    .tabItem { Label("Connections", systemImage: "link") }.tag(1)
-                SettingsView()
+                SummaryView(selectedTab: $selectedTab)
+                    .tabItem { Label("Сводка", systemImage: "list.bullet.rectangle") }.tag(1)
+                SettingsView(connectionDraft: $connectionDraft, showingConnections: $showingConnections)
                     .tabItem { Label("Settings", systemImage: "gearshape") }.tag(2)
             }
             .environmentObject(profiles)
             .environmentObject(session)
             .environmentObject(library)
+            .environmentObject(summary)
             .preferredColorScheme(preferredColorScheme)
             .tint(ZLTheme.focus)
             .toolbarBackground(ZLTheme.background, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .onChange(of: selectedTab) { _, _ in dismissZedLinkKeyboard() }
             .onChange(of: session.showConnections) { _, requested in
-                if requested { sessionsPath = []; selectedTab = 1; session.showConnections = false }
+                // Connections live in Settings › Connection & access.
+                if requested { sessionsPath = []; selectedTab = 2; showingConnections = true; session.showConnections = false }
+            }
+            .onChange(of: session.threads) { _, threads in
+                guard !session.demoPreview else { return }
+                summary.absorb(threads, profile: session.profile, targetID: session.targetID, hosts: session.workspaceHosts)
             }
             .task {
                 #if DEBUG
@@ -56,8 +64,9 @@ import SwiftUI
                 // Install only after initial profile restoration; earlier responses are queued.
                 ApprovalNotifications.shared.handler = { data, action in
                     selectedTab = 0
-                    await session.handleApprovalNotification(data, action: action)
+                    await session.handleApprovalNotification(data, action: action, profiles: profiles.profiles)
                 }
+                await SharedInboxProcessor.shared.process(profiles: profiles.profiles)
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active, session.profile != nil, !session.demoPreview {
@@ -65,6 +74,7 @@ import SwiftUI
                     Task {
                         await ApprovalNotifications.shared.refreshStatus()
                         await session.refresh()
+                        await SharedInboxProcessor.shared.process(profiles: profiles.profiles)
                     }
                 } else if phase != .active {
                     Task { await session.persistConversation() }
