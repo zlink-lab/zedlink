@@ -76,7 +76,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: zed-source
-          key: bundle-${{ env.ZED_REF }}
+          # Not keyed by ZED_REF: every pin got a cold 2.65 GB cache and a full ~45 min build.
+          # rust-cache already keys on Cargo.lock and the toolchain, so dependencies are reused
+          # across pins and only Zed's own crates rebuild.
+          key: bundle
           cache-on-failure: true
 
       # Zed's own packaging: zed with the bundle profile, the cli, the remote server, stripped,

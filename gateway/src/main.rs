@@ -41,6 +41,8 @@ use tokio::{
     task::JoinSet,
 };
 use uuid::Uuid;
+
+mod zed_control;
 use web_push::{
     ContentEncoding, IsahcWebPushClient, SubscriptionInfo, Urgency, VapidSignatureBuilder,
     WebPushClient, WebPushError, WebPushMessageBuilder,
@@ -81,6 +83,8 @@ struct Inner {
     /// When the phone last sent a message to a thread (`target:thread` key).
     phone_sends: Mutex<HashMap<String, Instant>>,
     failure_log: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Targets with a `zed.restart` in progress (no hung-Zed push meanwhile).
+    zed_restarts: std::sync::Mutex<HashSet<String>>,
 }
 struct ApnsProvider {
     team_id: String,
@@ -193,6 +197,8 @@ enum NotificationEvent {
     Done,
     Error,
     Stopped(&'static str),
+    /// The bridge accepts connections but stops answering (zed_control watchdog).
+    ZedHung,
 }
 
 impl NotificationEvent {
@@ -203,6 +209,7 @@ impl NotificationEvent {
             Self::Done => "done",
             Self::Error => "error",
             Self::Stopped(_) => "stopped",
+            Self::ZedHung => "zed_hung",
         }
     }
 }
@@ -311,6 +318,7 @@ fn push_body(event: NotificationEvent, snapshot: &Value) -> String {
             .map(|message| format!("Ошибка: {}", truncate_chars(message, PUSH_PREVIEW_CHARS)))
             .unwrap_or_else(|| "Ошибка".to_owned()),
         NotificationEvent::Stopped(reason) => format!("Остановлено: {reason}"),
+        NotificationEvent::ZedHung => "Zed не отвечает".to_owned(),
     }
 }
 
@@ -341,6 +349,12 @@ fn apns_payload(message: &PushMessage, gateway_id: &str, created: u64) -> Value 
     if let Some(subtitle) = &message.subtitle {
         alert["subtitle"] = json!(subtitle);
     }
+    if message.event == NotificationEvent::ZedHung {
+        return json!({"aps": {"alert": alert, "sound": "default", "category": "ZEDLINK_ZED",
+                "thread-id": format!("zed:{}", message.target_id)},
+            "type": "zed_hung", "event": message.event.kind(),
+            "gateway": gateway_id, "target": message.target_id, "created": created});
+    }
     json!({"aps": {"alert": alert, "sound": "default", "category": "ZEDLINK_REVIEW",
             "thread-id": message.thread_id},
         "type": "push", "event": message.event.kind(),
@@ -350,7 +364,12 @@ fn apns_payload(message: &PushMessage, gateway_id: &str, created: u64) -> Value 
 }
 
 fn apns_collapse_id(message: &PushMessage) -> String {
-    let mut id = format!("{}:{}", message.thread_id, message.event.kind());
+    let subject = if message.thread_id.is_empty() {
+        &message.target_id
+    } else {
+        &message.thread_id
+    };
+    let mut id = format!("{subject}:{}", message.event.kind());
     while id.len() > 64 {
         id.pop();
     }
@@ -446,6 +465,9 @@ struct ProbeTarget {
     id: String,
     label: String,
     probe: PathBuf,
+    /// systemd --user unit that runs this Zed (`zed.start` / `zed.restart`); see zed_control.
+    #[serde(default)]
+    zed_unit: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -571,6 +593,7 @@ async fn run_gateway(
         });
         servers_to_start.push((listener, tls));
     }
+    let targets = zed_control::apply_unit_from_environment(targets)?;
     let state = Gateway::load(directory, targets, route_origins, tls_identities)?;
     let admin = state.clone();
     tokio::spawn(async move {
@@ -580,6 +603,8 @@ async fn run_gateway(
     });
     let notifications = state.clone();
     tokio::spawn(async move { notifications.notification_monitor().await });
+    let watchdog = state.clone();
+    tokio::spawn(async move { watchdog.zed_watchdog().await });
 
     let mut servers = JoinSet::new();
     for (listener, tls) in servers_to_start {
@@ -625,6 +650,7 @@ async fn main() -> Result<()> {
                     id: "default".into(),
                     label: "This Zed".into(),
                     probe,
+                    zed_unit: None,
                 }],
                 directory,
             )
@@ -649,6 +675,7 @@ async fn main() -> Result<()> {
                     id: "default".into(),
                     label: "This Zed".into(),
                     probe: PathBuf::from(&args[2]),
+                    zed_unit: None,
                 }],
                 PathBuf::from(&args[3]),
             )
@@ -1066,6 +1093,7 @@ impl Gateway {
             apns: ApnsProvider::from_environment()?,
             phone_sends: Mutex::new(HashMap::new()),
             failure_log: std::sync::Mutex::new(HashMap::new()),
+            zed_restarts: std::sync::Mutex::new(HashSet::new()),
         })))
     }
     async fn authorize(&self, headers: &HeaderMap) -> Option<Uuid> {
@@ -1358,7 +1386,9 @@ impl Gateway {
         body: &str,
         message: Option<&PushMessage>,
     ) -> PushOutcome {
-        let thread_id = message.map(|message| message.thread_id.as_str());
+        let thread_id = message
+            .map(|message| message.thread_id.as_str())
+            .filter(|id| !id.is_empty());
         let target_id = message.map(|message| message.target_id.as_str());
         let approval = message.is_some_and(|message| message.event == NotificationEvent::Approval);
         let private_key = self.0.persisted.lock().await.vapid_private_key.clone();
@@ -2254,6 +2284,9 @@ fn allowed_rpc_method(method: &str) -> bool {
             | "project.upload.chunk"
             | "project.upload.commit"
             | "project.upload.abort"
+            | "zed.status"
+            | "zed.start"
+            | "zed.restart"
             | "project.directory"
             | "project.file"
             | "project.search"
@@ -2377,6 +2410,16 @@ async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> i
             StatusCode::OK,
             Json(json!({"version":1,"request_id":original_request_id,"result":result})),
         );
+    }
+    if method.starts_with("zed.") {
+        let (status, body) = state
+            .zed_rpc(&method, target_id.as_deref(), &request["params"])
+            .await;
+        let body = match body {
+            Ok(result) => json!({"version":1,"request_id":original_request_id,"result":result}),
+            Err(error) => json!({"version":1,"request_id":original_request_id,"error":error}),
+        };
+        return (status, Json(body));
     }
     if method == "session.resume" {
         let Some(target_id) = target_id.as_deref() else {

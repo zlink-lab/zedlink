@@ -1,0 +1,19 @@
+# Patched Zed as a systemd --user unit, so the ZedLink gateway can start and restart it
+# (zed.start / zed.restart). Install: see gateway/systemd/README.md.
+[Unit]
+Description=Zed (ZLink bridge)
+# Zed needs the graphical session's DISPLAY / WAYLAND_DISPLAY.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/zed.app/libexec/zed-editor
+# The gateway decides about restarts; a crash must not loop.
+Restart=no
+# Zed has no SIGTERM handler. The gateway quits it through the bridge (instance.quit) first;
+# this only matters for `systemctl --user stop`.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=graphical-session.target
