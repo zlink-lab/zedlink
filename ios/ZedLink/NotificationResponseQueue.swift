@@ -31,9 +31,9 @@ import Foundation
         // `zed_hung` names a connection and Zed target only: no instance, epoch or thread.
         let zedAlert = data["type"] == "zed_hung"
         let reviewOnly = gatewayPush || zedAlert || ["agent_error", "turn_status", "compaction", "input_needed"].contains(data["type"] ?? "")
-        // APNs reuses the collapse id (`<target>:zed_hung`) as the request id for every outage;
-        // `created` tells a later outage apart from a replay of the same alert.
-        let id = zedAlert ? rawID + "@" + (data["created"] ?? "") : rawID
+        // APNs reuses the collapse id (`<target>:zed_hung`, `<thread>:<event>`) as the request id
+        // for every later alert of that kind; `created` tells a new alert apart from a replay.
+        let id = (zedAlert || gatewayPush) ? rawID + "@" + (data["created"] ?? "") : rawID
         let required: [String]
         if zedAlert { required = ["gateway", "target"] }
         else if gatewayPush { required = ["gateway", "thread"] }
