@@ -135,6 +135,20 @@ final class NativeContentTests: XCTestCase {
     }
 
     @MainActor
+    func testRouteDetectionKeepsTailscaleForItsRangesOnly() {
+        XCTAssertEqual(RouteKind.detect(endpoint: "https://192.168.1.15:44679"), .local)
+        XCTAssertEqual(RouteKind.detect(endpoint: "https://10.0.0.2"), .local)
+        XCTAssertEqual(RouteKind.detect(endpoint: "https://172.20.1.1:8443"), .local)
+        XCTAssertEqual(RouteKind.detect(endpoint: "https://100.101.102.103:44679"), .tailscale)
+        XCTAssertEqual(RouteKind.detect(endpoint: "https://desk.tail1234.ts.net"), .tailscale)
+        XCTAssertNil(RouteKind.detect(endpoint: "https://100.200.1.1"))
+        XCTAssertNil(RouteKind.detect(endpoint: "https://zed.example.com"))
+        let migrated = ProfileStore.migratedRoutes([ConnectionProfile(name: "Desktop", route: .tailscale,
+            endpoint: "https://192.168.1.15:44679", gatewayID: "fixture")])
+        XCTAssertEqual(migrated.first?.route, .local)
+    }
+
+    @MainActor
     func testProfileStoreKeepsAnotherRouteToTheSameGateway() {
         let original = ConnectionProfile(name: "Tailscale", route: .tailscale,
             endpoint: "https://zed.tailnet.example", gatewayID: "FIXTURE-GATEWAY")

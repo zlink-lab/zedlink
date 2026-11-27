@@ -18,6 +18,35 @@ enum RouteKind: String, CaseIterable, Codable, Identifiable {
         case .custom: "Enter the HTTPS address of a trusted reverse proxy that forwards ZedLink API requests."
         }
     }
+
+    /// The route an address clearly belongs to, or nil when only the user can tell. Tailscale is
+    /// claimed only for its CGNAT range 100.64.0.0/10, its IPv6 prefix and `*.ts.net` names;
+    /// private ranges and `.local` names are the local network.
+    static func detect(endpoint: String) -> RouteKind? {
+        guard let rawHost = URLComponents(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines))?.host else { return nil }
+        let host: String = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if host.isEmpty { return nil }
+        if host.hasSuffix(".ts.net") { return .tailscale }
+        if host.contains(":") {
+            if host.hasPrefix("fd7a:115c:a1e0:") { return .tailscale }
+            if host.hasPrefix("fc") || host.hasPrefix("fd") || host.hasPrefix("fe80:") || host == "::1" { return .local }
+            return nil
+        }
+        let labels: [Substring] = host.split(separator: ".", omittingEmptySubsequences: false)
+        let octets: [Int] = labels.compactMap { Int($0) }
+        if labels.count == 4 && octets.count == 4 {
+            guard octets.allSatisfy({ (0...255).contains($0) }) else { return nil }
+            let first: Int = octets[0], second: Int = octets[1]
+            if first == 100 && (64...127).contains(second) { return .tailscale }
+            if first == 10 || first == 127 || (first == 172 && (16...31).contains(second))
+                || (first == 192 && second == 168) || (first == 169 && second == 254) { return .local }
+            return nil
+        }
+        if host == "localhost" || host.hasSuffix(".local") || host.hasSuffix(".lan") || host.hasSuffix(".home.arpa") || !host.contains(".") {
+            return .local
+        }
+        return nil
+    }
 }
 
 struct ConnectionProfile: Codable, Identifiable, Equatable {
@@ -87,8 +116,11 @@ struct NativeThread: Identifiable, Equatable {
     var hostID: String? = nil
     var projectID: String? = nil
     var workspacePaths: [String] = []
+    /// Human names from newer bridges (`host_label`, `workspace_label`), e.g. "hotbot2" · "zedlink".
+    var hostLabel: String? = nil
+    var workspaceLabel: String? = nil
 
-    var searchText: String { [title, agentName, id, project ?? ""].joined(separator: " ") }
+    var searchText: String { [title, agentName, id, project ?? "", hostLabel ?? "", workspaceLabel ?? ""].joined(separator: " ") }
 }
 
 struct NativeCommand: Identifiable, Equatable {
@@ -410,12 +442,15 @@ struct PendingSend: Codable {
     var text: String?
     var contextPaths: [String] = []
     var attachments: [PromptAttachment] = []
+    /// `upload_ref`s from `project.upload.commit` (files already written to the project).
+    var uploadRefs: [String] = []
 
     var submissionParams: [String: Any] {
         var params: [String: Any] = ["instance_id": instanceID, "epoch": epoch, "thread_id": threadID, "text": text ?? ""]
         if localConfirmed == true { params["local_confirmed"] = true }
         if !contextPaths.isEmpty { params["context_paths"] = contextPaths }
         if !attachments.isEmpty { params["uploads"] = attachments.map(\.payload) }
+        if !uploadRefs.isEmpty { params["upload_refs"] = uploadRefs }
         return params
     }
 
@@ -562,6 +597,10 @@ struct RecentHistoryThread: Identifiable, Equatable {
     let thread: WorkspaceHistoryThread
     let project: String
     let host: String?
+    var hostID: String = ""
+    var projectID: String = ""
+    /// Always set (also for "This computer"), for the host badge on rows.
+    var hostLabel: String = ""
 
     var id: String { thread.id }
     var searchText: String { [thread.title ?? "", thread.agent, project, host ?? ""].joined(separator: " ") }
@@ -579,7 +618,8 @@ struct RecentHistoryThread: Identifiable, Equatable {
         for host in hosts {
             for project in host.projects {
                 for thread in project.threads {
-                    rows.append(RecentHistoryThread(thread: thread, project: project.name, host: host.isSSH ? host.label : nil))
+                    rows.append(RecentHistoryThread(thread: thread, project: project.name, host: host.isSSH ? host.label : nil,
+                                                    hostID: host.id, projectID: project.id, hostLabel: host.label))
                 }
             }
         }
@@ -592,9 +632,19 @@ extension WorkspaceHistoryThread {
     init?(row: [String: Any]) {
         guard let id = row["thread_id"] as? String, !id.isEmpty else { return nil }
         let title: String? = (row["title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        self.init(id: id, title: title, agent: row["agent"] as? String ?? "Agent",
+        self.init(id: id, title: title, agent: WorkspaceHistoryThread.agentName(row["agent"]),
                   updatedAt: WorkspaceHistoryThread.date(row["updated_at"] as? String),
                   loaded: row["loaded"] as? Bool ?? false)
+    }
+
+    /// `agent` is a name or id string, or `{id, name}` from newer bridges (e.g. `claude-acp`).
+    static func agentName(_ value: Any?) -> String {
+        if let text = value as? String, !text.isEmpty { return text }
+        if let row = value as? [String: Any] {
+            if let name = row["name"] as? String, !name.isEmpty { return name }
+            if let id = row["id"] as? String, !id.isEmpty { return id }
+        }
+        return "Agent"
     }
 
     static func date(_ text: String?) -> Date? {

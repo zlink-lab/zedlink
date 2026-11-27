@@ -1,3 +1,5 @@
+# The app alone: no App Group, no share extension. This is what the simulator workflows and the
+# default TestFlight lane build. project-share.yml adds the ZLinkShare extension on top of it.
 name: ZedLink
 options:
   bundleIdPrefix: dev.zedlink
@@ -6,6 +8,10 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
+    # One version for the app and (in project-share.yml) its share extension; App Store
+    # validation requires both to match. CI sets CURRENT_PROJECT_VERSION to the run number.
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "1"
 targets:
   ZedLink:
     type: application
@@ -19,8 +25,6 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.zedlink.app
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: ZedLink
