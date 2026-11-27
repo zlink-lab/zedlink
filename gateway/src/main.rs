@@ -48,6 +48,11 @@ use web_push::{
     WebPushClient, WebPushError, WebPushMessageBuilder,
 };
 
+/// Release tag set by .github/workflows/gateway-release.yml; the updater compares it.
+const GATEWAY_BUILD: &str = match option_env!("ZEDLINK_GATEWAY_BUILD") {
+    Some(build) => build,
+    None => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+};
 const MAX_RPC: usize = 2 * 1024 * 1024;
 const MAX_PROBE_RESPONSE: u64 = 4 * 1024 * 1024;
 const PAIR_TTL: Duration = Duration::from_secs(300);
@@ -705,6 +710,10 @@ async fn main() -> Result<()> {
                 PathBuf::from(&args[3]),
             )
             .await
+        }
+        Some("version") if args.len() == 1 => {
+            println!("{GATEWAY_BUILD}");
+            Ok(())
         }
         Some("admin") if args.len() >= 3 => {
             let command = match args[2].as_str() {
@@ -1707,6 +1716,7 @@ fn validate_probe_socket(probe: &Path) -> Result<()> {
 async fn info(State(state): State<Gateway>) -> Json<Value> {
     Json(json!({
         "version": 1,
+        "build": GATEWAY_BUILD,
         "gateway_id": state.0.persisted.lock().await.gateway_id,
         "route_origins": state.0.route_origins,
     }))

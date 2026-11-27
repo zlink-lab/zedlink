@@ -1,0 +1,7 @@
+[Unit]
+Description=Update the ZedLink gateway from GitHub releases
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I %h/.local/share/zedlink/gateway/release/current/systemd/zedlink-gateway-update

@@ -31,3 +31,27 @@ stopped with SIGTERM, then SIGKILL.
   desktop launcher at `systemctl --user start zed-zlink.service`.
 - A logged-out user has no graphical session: Zed cannot be started. A locked screen is fine.
 - `Restart=no` is deliberate; the gateway only restarts on request from the phone.
+
+## Gateway auto-update
+
+Releases `gateway-v<n>` (workflow "Gateway release", never marked Latest) carry
+`zedlink-gateway-linux-x86_64.tar.gz` (binary + this `systemd/` folder) and its `.sha256`.
+`zedlink-gateway-update` installs the newest one into
+`~/.local/share/zedlink/gateway/release/versions/<tag>`, points `current` at it, restarts
+`zedlink-gateway.service`, and switches back if the unit is not active 10 s later (that release
+is then skipped until `--tag` forces it). It keeps the last three versions.
+
+First install (once):
+
+```sh
+python3 -I zedlink-gateway-update --no-restart        # from an unpacked release or the repo
+systemctl --user edit --full zedlink-gateway.service  # ExecStart= → %h/.local/share/zedlink/gateway/release/current/zedlink-gateway <same arguments>
+cp ~/.local/share/zedlink/gateway/release/current/systemd/zedlink-gateway-update.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user restart zedlink-gateway.service
+systemctl --user enable --now zedlink-gateway-update.timer
+```
+
+Check: `zedlink-gateway-update --check`, `journalctl --user -u zedlink-gateway-update`,
+`curl -sk https://<gateway>/v1/gateway` shows `build`. Updating the gateway drops phone
+connections for a few seconds; the app reconnects.

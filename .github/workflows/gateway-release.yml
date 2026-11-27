@@ -1,0 +1,76 @@
+# The gateway binary for Linux x86_64 as a GitHub release, picked up by
+# gateway/systemd/zedlink-gateway-update on the desktop (daily timer).
+# Tags are gateway-v<n>; releases are never marked "Latest" so they do not hide the Zed releases.
+name: Gateway release
+
+on:
+  push:
+    tags: ['gateway-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create, gateway-v<n> (empty = gateway-v<run number>)
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gateway-release
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release tag
+        run: |
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            case "$GITHUB_REF" in
+              refs/tags/gateway-v*) tag="${GITHUB_REF#refs/tags/}" ;;
+              *) tag="gateway-v$GITHUB_RUN_NUMBER" ;;
+            esac
+          fi
+          case "$tag" in
+            gateway-v[0-9]*) ;;
+            *) echo "::error::tag $tag must look like gateway-v<n>"; exit 1 ;;
+          esac
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "ZEDLINK_GATEWAY_BUILD=$tag+${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gateway
+          key: gateway-release
+
+      - name: Test
+        run: cargo test --release --manifest-path gateway/Cargo.toml --locked
+
+      - name: Build
+        run: cargo build --release --manifest-path gateway/Cargo.toml --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist/zedlink-gateway
+          cp gateway/target/release/zedlink-gateway dist/zedlink-gateway/
+          cp -r gateway/systemd dist/zedlink-gateway/
+          test "$(dist/zedlink-gateway/zedlink-gateway version)" = "$ZEDLINK_GATEWAY_BUILD"
+          tar -C dist -czf dist/zedlink-gateway-linux-x86_64.tar.gz zedlink-gateway
+          cd dist
+          sha256sum zedlink-gateway-linux-x86_64.tar.gz > zedlink-gateway-linux-x86_64.tar.gz.sha256
+          cat zedlink-gateway-linux-x86_64.tar.gz.sha256
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="ZedLink gateway $ZEDLINK_GATEWAY_BUILD, Linux x86_64 (zedlink $GITHUB_SHA, ref $GITHUB_REF_NAME).
+          Installed and updated by gateway/systemd/zedlink-gateway-update."
+          gh release create "$RELEASE_TAG" \
+            dist/zedlink-gateway-linux-x86_64.tar.gz dist/zedlink-gateway-linux-x86_64.tar.gz.sha256 \
+            --target "$GITHUB_SHA" --latest=false \
+            --title "Gateway ${RELEASE_TAG#gateway-v}" --notes "$notes"

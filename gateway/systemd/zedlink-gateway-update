@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Install or update the ZedLink gateway from GitHub releases (gateway-v<n>).
+
+Layout (all under ~/.local/share/zedlink/gateway/release):
+  versions/<tag>/zedlink-gateway, versions/<tag>/systemd/...
+  current -> versions/<tag>         (the gateway unit runs current/zedlink-gateway)
+
+Steps: newest gateway-v<n> release → download tarball + .sha256 → verify → unpack →
+`zedlink-gateway version` must name the tag → switch `current` → restart the unit →
+if the unit is not active 10 s later, switch back and restart again (exit 1).
+
+Usage: zedlink-gateway-update [--check] [--tag gateway-vN] [--no-restart]
+Env: ZEDLINK_REPOSITORY (zlink-lab/zedlink), ZEDLINK_GATEWAY_UNIT (zedlink-gateway.service).
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+REPOSITORY = os.environ.get("ZEDLINK_REPOSITORY", "zlink-lab/zedlink")
+UNIT = os.environ.get("ZEDLINK_GATEWAY_UNIT", "zedlink-gateway.service")
+ROOT = Path.home() / ".local/share/zedlink/gateway/release"
+ARCHIVE = "zedlink-gateway-linux-x86_64.tar.gz"
+TAG = re.compile(r"^gateway-v(\d+)$")
+KEEP_VERSIONS = 3
+
+
+def log(message):
+    print(f"zedlink-gateway-update: {message}", flush=True)
+
+
+def fetch(url, limit):
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "zedlink-gateway-update", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise RuntimeError(f"response from {url} exceeds {limit} bytes")
+    return data
+
+
+def releases():
+    data = json.loads(fetch(f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100", 8 << 20))
+    found = []
+    for release in data:
+        match = TAG.match(release.get("tag_name", ""))
+        if match and not release.get("draft") and not release.get("prerelease"):
+            found.append((int(match.group(1)), release))
+    return [release for _, release in sorted(found, key=lambda item: item[0], reverse=True)]
+
+
+def asset_url(release, name):
+    for asset in release.get("assets", []):
+        if asset.get("name") == name:
+            return asset["browser_download_url"]
+    raise RuntimeError(f"release {release['tag_name']} has no {name}")
+
+
+def current_tag():
+    link = ROOT / "current"
+    return os.readlink(link).split("/")[-1] if link.is_symlink() else None
+
+
+def switch_current(tag):
+    temporary = ROOT / "current.new"
+    if temporary.is_symlink() or temporary.exists():
+        temporary.unlink()
+    temporary.symlink_to(Path("versions") / tag)
+    os.replace(temporary, ROOT / "current")
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=60)
+
+
+def unit_healthy():
+    time.sleep(10)
+    state = systemctl("show", "-p", "ActiveState", "--value", UNIT).stdout.strip()
+    return state == "active"
+
+
+def install(release):
+    tag = release["tag_name"]
+    target = ROOT / "versions" / tag
+    if target.exists():
+        return target
+    (ROOT / "versions").mkdir(parents=True, exist_ok=True)
+    expected = fetch(asset_url(release, ARCHIVE + ".sha256"), 4096).decode().split()[0]
+    archive = fetch(asset_url(release, ARCHIVE), 256 << 20)
+    actual = hashlib.sha256(archive).hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"checksum mismatch for {tag}: {actual} != {expected}")
+    staging = Path(tempfile.mkdtemp(prefix=f".{tag}.", dir=ROOT / "versions"))
+    try:
+        archive_path = staging / ARCHIVE
+        archive_path.write_bytes(archive)
+        with tarfile.open(archive_path) as bundle:
+            bundle.extractall(staging, filter="data")
+        unpacked = staging / "zedlink-gateway"
+        binary = unpacked / "zedlink-gateway"
+        version = subprocess.run([str(binary), "version"], capture_output=True, text=True, timeout=10)
+        if version.returncode != 0 or not version.stdout.strip().startswith(tag + "+"):
+            raise RuntimeError(f"{tag}: binary reports {version.stdout.strip()!r}")
+        os.replace(unpacked, target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return target
+
+
+def prune(keep):
+    versions = ROOT / "versions"
+    tags = sorted((path.name for path in versions.iterdir() if TAG.match(path.name)),
+                  key=lambda name: int(TAG.match(name).group(1)), reverse=True)
+    for name in tags[KEEP_VERSIONS:]:
+        if name not in keep:
+            shutil.rmtree(versions / name, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--check", action="store_true", help="only report what would be installed")
+    parser.add_argument("--tag", help="install this gateway-v<n> instead of the newest")
+    parser.add_argument("--no-restart", action="store_true", help="switch `current` but do not restart the unit")
+    options = parser.parse_args()
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with open(ROOT / ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("another update is running")
+            return 0
+        available = releases()
+        if options.tag:
+            available = [release for release in available if release["tag_name"] == options.tag]
+        else:
+            # A release that failed to start is not retried every hour; `--tag` forces it.
+            available = [release for release in available
+                         if not (ROOT / f"failed-{release['tag_name']}").exists()]
+        if not available:
+            log("no gateway release found")
+            return 1
+        release = available[0]
+        tag = release["tag_name"]
+        previous = current_tag()
+        if previous == tag:
+            log(f"{tag} is installed")
+            return 0
+        if options.check:
+            log(f"would install {tag} (installed: {previous or 'none'})")
+            return 0
+        install(release)
+        switch_current(tag)
+        log(f"installed {tag} (was {previous or 'none'})")
+        if options.no_restart:
+            return 0
+        systemctl("restart", UNIT)
+        if unit_healthy():
+            log(f"{UNIT} is running {tag}")
+            prune({tag, previous})
+            return 0
+        if previous:
+            (ROOT / f"failed-{tag}").touch()
+            log(f"{UNIT} did not stay active on {tag}; rolling back to {previous}")
+            switch_current(previous)
+            systemctl("restart", UNIT)
+        else:
+            log(f"{UNIT} did not stay active on {tag}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
