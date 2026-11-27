@@ -867,8 +867,9 @@ private struct SessionRow: View {
             if session.state != .live { ConnectionStatusView(state: session.state) }
             if session.state == .live && !session.controlsIssue.isEmpty {
                 Button { Task { await session.refreshSessionControls() } } label: {
-                    Label("Some controls didn't load · Retry", systemImage: "arrow.clockwise")
-                        .font(.caption2).foregroundStyle(ZLTheme.muted)
+                    Label("Retry · \(session.controlsIssue)", systemImage: "arrow.clockwise")
+                        .font(.caption2).foregroundStyle(ZLTheme.muted).lineLimit(2)
+                        .multilineTextAlignment(.leading)
                 }
                 .accessibilityHint("Retries loading approvals, queue and agent settings; the conversation is live")
             }

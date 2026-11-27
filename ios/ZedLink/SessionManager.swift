@@ -1168,11 +1168,32 @@ import Network
         }
     }
 
+    /// Each control loads on its own, so one failing method (for example the command list
+    /// of a fresh thread) no longer hides the model/effort controls. Settings load first.
     private func loadAuxiliaryState(_ id: String) async throws {
-        if Date().timeIntervalSince(lastCommandsRefresh) >= 5 { try await loadCommands(id) }
-        guard let client, id == selectedThreadID else { return }
+        guard client != nil, id == selectedThreadID else { return }
         let scope = operationScope
         let base: [String: Any] = ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": id]
+        var failures: [String] = []
+        let parts: [(String, () async throws -> Void)] = [
+            ("thread.settings", { try await self.loadThreadSettings(id, base: base, scope: scope) }),
+            ("thread.commands", { if Date().timeIntervalSince(self.lastCommandsRefresh) >= 5 { try await self.loadCommands(id) } }),
+            ("thread.elicitations", { try await self.loadElicitations(id, base: base, scope: scope) }),
+            ("thread.queue", { try await self.loadQueue(id, base: base, scope: scope) }),
+            ("thread.edit_review", { try await self.loadEditReview(id, base: base, scope: scope) }),
+        ]
+        for (method, load) in parts {
+            do { try await load() } catch {
+                if isCancelledRequest(error) { throw error }
+                failures.append("\(method): \(error.localizedDescription)")
+            }
+            guard scope == operationScope else { return }
+        }
+        if !failures.isEmpty { throw GatewayFailure.native(failures.joined(separator: "; ")) }
+    }
+
+    private func loadElicitations(_ id: String, base: [String: Any], scope: [String]) async throws {
+        guard let client else { return }
         if capabilities.contains("thread.elicitations") {
             let result = try await client.rpc("thread.elicitations", params: base)
             guard scope == operationScope else { return }
@@ -1183,6 +1204,10 @@ import Network
                     instance: instanceID, epoch: epoch, thread: id, inputIDs: elicitations.map(\.id))
             }
         } else { elicitations = [] }
+    }
+
+    private func loadQueue(_ id: String, base: [String: Any], scope: [String]) async throws {
+        guard let client else { return }
         if capabilities.contains("thread.queue") {
             let result = try await client.rpc("thread.queue", params: base)
             guard scope == operationScope else { return }
@@ -1192,14 +1217,30 @@ import Network
                                         steer: row["steer"] as? Bool ?? false)
             }
         } else { queuedMessages = [] }
+    }
+
+    private func loadEditReview(_ id: String, base: [String: Any], scope: [String]) async throws {
+        guard let client else { return }
         if capabilities.contains("thread.edit_review") {
-            let result = try await client.rpc("thread.edit_review", params: base)
+            let result: [String: Any]
+            do {
+                result = try await client.rpc("thread.edit_review", params: base)
+            } catch let failure as GatewayFailure {
+                // External agents have no Zed edit review; that is not a failure.
+                guard case .native(let code) = failure, code == "UNSUPPORTED_CAPABILITY" else { throw failure }
+                if scope == operationScope { editReview = nil }
+                return
+            }
             guard scope == operationScope else { return }
             editReview = result["pending"] as? Bool == true
                 ? NativeEditReview(changedFiles: result["changed_files"] as? Int ?? 0,
                                    linesAdded: result["lines_added"] as? Int ?? 0,
                                    linesRemoved: result["lines_removed"] as? Int ?? 0) : nil
         } else { editReview = nil }
+    }
+
+    private func loadThreadSettings(_ id: String, base: [String: Any], scope: [String]) async throws {
+        guard let client else { return }
         if capabilities.contains("thread.settings") {
             let result: [String: Any]
             do {
