@@ -244,16 +244,25 @@ fn remote_thread_key(target_id: &str, thread_id: &str) -> String {
 }
 
 /// Whether the bridge reported a user message typed in desktop Zed.
+/// A later update may relabel the same entry as remote (its receipt arrived late).
 fn has_local_user_message(events: &Value, through_sequence: u64) -> bool {
-    events.as_array().is_some_and(|events| {
-        events.iter().any(|event| {
-            event["entry_kind"] == "user"
-                && event["origin"] == "local"
-                && event["sequence"]
-                    .as_u64()
-                    .is_some_and(|sequence| sequence <= through_sequence)
-        })
-    })
+    let Some(events) = events.as_array() else {
+        return false;
+    };
+    let user_events = events.iter().filter(|event| {
+        event["entry_kind"] == "user"
+            && event["sequence"]
+                .as_u64()
+                .is_some_and(|sequence| sequence <= through_sequence)
+    });
+    let remote_entries = user_events
+        .clone()
+        .filter(|event| event["origin"] == "remote")
+        .map(|event| &event["entry_index"])
+        .collect::<Vec<_>>();
+    user_events
+        .filter(|event| event["origin"] == "local")
+        .any(|event| !remote_entries.contains(&&event["entry_index"]))
 }
 
 fn latest_stop_reason(events: &Value, through_sequence: u64) -> Option<&str> {
@@ -2761,10 +2770,15 @@ mod tests {
         let events = json!([
             {"sequence": 2, "kind": "entry.added", "entry_kind": "user", "origin": "remote"},
             {"sequence": 3, "kind": "entry.added"},
-            {"sequence": 5, "kind": "entry.added", "entry_kind": "user", "origin": "local"},
+            {"sequence": 5, "kind": "entry.added", "entry_kind": "user", "origin": "local", "entry_index": 7},
         ]);
         assert!(!has_local_user_message(&events, 4));
         assert!(has_local_user_message(&events, 5));
         assert!(!has_local_user_message(&json!([]), 9));
+        let relabelled = json!([
+            {"sequence": 1, "kind": "entry.added", "entry_kind": "user", "origin": "local", "entry_index": 3},
+            {"sequence": 2, "kind": "entry.updated", "entry_kind": "user", "origin": "remote", "entry_index": 3},
+        ]);
+        assert!(!has_local_user_message(&relabelled, 2));
     }
 }
