@@ -9,6 +9,9 @@ struct ConnectionDraft {
     var name = "Desktop"
     var route: RouteKind = .tailscale
     var endpoint = ""
+    /// The optional second address of the same gateway on the Yggdrasil mesh.
+    var meshEndpoint = ""
+    var lastWorkingEndpoint: String? = nil
     var expectedID = ""
     var code = ""
     var deviceName = "iPhone"
@@ -17,6 +20,7 @@ struct ConnectionDraft {
     init(_ profile: ConnectionProfile) {
         id = profile.id; name = profile.name; route = profile.route
         endpoint = profile.endpoint; expectedID = profile.gatewayID; editing = true
+        meshEndpoint = profile.meshEndpoint ?? ""; lastWorkingEndpoint = profile.lastWorkingEndpoint
     }
 }
 
@@ -98,6 +102,17 @@ struct ConnectionsView: View {
                             Text("Private HTTPS address").font(.footnote).foregroundStyle(ZLTheme.muted)
                             Text(profile.endpoint).font(.footnote.monospaced()).textSelection(.enabled)
                                 .fixedSize(horizontal: false, vertical: true)
+                            if let mesh = profile.meshEndpoint, !mesh.isEmpty {
+                                Text("Mesh-адрес (Yggdrasil)").font(.footnote).foregroundStyle(ZLTheme.muted)
+                                Text(mesh).font(.footnote.monospaced()).textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            if session.profile?.id == profile.id, session.state == .live,
+                               let route = session.activeRouteLabel {
+                                Label("Подключено \(route)", systemImage: "network")
+                                    .font(.footnote).foregroundStyle(ZLTheme.muted)
+                                    .accessibilityIdentifier("active-route")
+                            }
                         }
                         Text(profile.route.guidance).font(.footnote).foregroundStyle(ZLTheme.muted)
                         if session.profile?.id == profile.id, !session.issue.isEmpty {
@@ -368,8 +383,14 @@ private struct ConnectionDetailView: View {
                     Text(profile.name).font(.headline)
                     Text(profile.route.rawValue).foregroundStyle(ZLTheme.muted)
                     Text(profile.endpoint).font(.caption.monospaced()).textSelection(.enabled)
+                    if let mesh = profile.meshEndpoint, !mesh.isEmpty {
+                        Text("Mesh: " + mesh).font(.caption.monospaced()).textSelection(.enabled)
+                    }
                     if session.profile?.id == profile.id {
                         ConnectionStatusView(state: session.state)
+                        if session.state == .live, let route = session.activeRouteLabel {
+                            Text("Подключено \(route)").font(.caption).foregroundStyle(ZLTheme.muted)
+                        }
                         if !session.issue.isEmpty {
                             if let help = ConnectionHelp.forMessage(session.issue) { Text(help.title).font(.headline); Text(help.detail).font(.caption) }
                             else { Text(session.issue).font(.caption).foregroundStyle(ZLTheme.warning) }
@@ -429,11 +450,17 @@ struct AddConnectionView: View {
     @State private var showingScanner = false
     @State private var showingIdentity = false
     @State private var observedID = "" // the gateway identity seen by the last Test; never kept in the draft
+    /// Result of the last mesh-address test (empty: not tested since the last edit).
+    @State private var meshResult = ""
+    @State private var meshPassed = false
 
     private var candidate: ConnectionProfile {
-        ConnectionProfile(id: draft.id, name: name.trimmingCharacters(in: .whitespacesAndNewlines), route: route,
-                          endpoint: endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
-                          gatewayID: expectedID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        let mesh: String = draft.meshEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ConnectionProfile(id: draft.id, name: name.trimmingCharacters(in: .whitespacesAndNewlines), route: route,
+                                 endpoint: endpoint.trimmingCharacters(in: .whitespacesAndNewlines),
+                                 gatewayID: expectedID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                                 meshEndpoint: mesh.isEmpty ? nil : mesh,
+                                 lastWorkingEndpoint: draft.lastWorkingEndpoint)
     }
 
     private var savedGateway: ConnectionProfile? {
@@ -489,7 +516,6 @@ struct AddConnectionView: View {
                         .accessibilityIdentifier("gateway-endpoint")
                     Button("Test HTTPS endpoint") { Task { await testEndpoint() } }
                         .disabled(busy).accessibilityIdentifier("test-connection")
-                    
                     DisclosureGroup("Gateway identity", isExpanded: $showingIdentity) {
                         if !observedID.isEmpty {
                             VStack(alignment: .leading, spacing: 4) {
@@ -501,6 +527,21 @@ struct AddConnectionView: View {
                             .textInputAutocapitalization(.never).autocorrectionDisabled()
                             .disabled(draft.editing || busy).accessibilityIdentifier("expected-gateway-id")
                     }
+                }
+                Section {
+                    TextField("https://[201:…]:8443", text: $draft.meshEndpoint)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                        .disabled(busy)
+                        .accessibilityIdentifier("gateway-mesh-endpoint")
+                    Button("Проверить mesh-адрес") { Task { await testMeshEndpoint() } }
+                        .disabled(busy || draft.meshEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("test-mesh-connection")
+                    if !meshResult.isEmpty {
+                        Label(meshResult, systemImage: meshPassed ? "checkmark.circle" : "exclamationmark.triangle")
+                            .font(.footnote).foregroundStyle(meshPassed ? ZLTheme.healthy : ZLTheme.warning)
+                    }
+                } header: { Text("Mesh-адрес (Yggdrasil)") } footer: {
+                    Text("Необязательно. Второй адрес этого же gateway в сети Yggdrasil (200::/7). Если основной адрес недоступен, приложение пробует этот, с той же проверкой HTTPS и gateway ID. Других запасных адресов нет.")
                 }
                 Section(draft.editing ? "Save connection" : "Pair this iPhone") {
                     if savedGateway != nil {
@@ -553,6 +594,7 @@ struct AddConnectionView: View {
             .onChange(of: expectedID) { _, _ in
                 if !observedID.isEmpty { issue = identityIssue }
             }
+            .onChange(of: draft.meshEndpoint) { _, _ in meshResult = ""; meshPassed = false }
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Close") { dismiss() }.disabled(busy) } }
             .sheet(isPresented: $showingScanner) {
                 NavigationStack {
@@ -610,7 +652,9 @@ struct AddConnectionView: View {
         busy = true; busyStage = "Checking gateway HTTPS…"
         defer { busy = false; busyStage = "" }; observedID = ""
         do {
-            observedID = try await GatewayClient(profile: candidate, token: nil).gatewayID()
+            // Exactly this address: the editor tests each configured address on its own.
+            let profile: ConnectionProfile = candidate
+            observedID = try await GatewayClient(profile: profile, token: nil).gatewayID(at: profile.endpoint)
             if expectedID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                let existing = profiles.profiles.first(where: { $0.gatewayID.caseInsensitiveCompare(observedID) == .orderedSame }) {
                 expectedID = existing.gatewayID
@@ -618,6 +662,31 @@ struct AddConnectionView: View {
             showingIdentity = true
             issue = identityIssue
         } catch { issue = error.localizedDescription }
+    }
+
+    /// The mesh address must reach the same gateway as the main one (same `gateway_id`).
+    private func testMeshEndpoint() async {
+        guard !busy else { return }
+        let profile: ConnectionProfile = candidate
+        guard let mesh = profile.meshEndpoint else { return }
+        busy = true; busyStage = "Проверяю mesh-адрес…"
+        defer { busy = false; busyStage = "" }
+        meshResult = ""; meshPassed = false
+        do {
+            let observed: String = try await GatewayClient(profile: profile, token: nil).gatewayID(at: mesh)
+            let expected: String = profile.gatewayID.isEmpty ? observedID : profile.gatewayID
+            if expected.isEmpty {
+                meshResult = "HTTPS работает, gateway ID: \(observed). Сравните его с ID на рабочей станции."
+            } else if observed.caseInsensitiveCompare(expected) == .orderedSame {
+                meshPassed = true
+                meshResult = "HTTPS и gateway ID совпадают: это тот же gateway."
+            } else {
+                meshResult = "По этому адресу отвечает другой gateway. Он не будет использоваться для этого подключения."
+            }
+            if !RouteKind.isYggdrasil(URLComponents(string: mesh)?.host ?? "") {
+                meshResult += " Адрес не из 200::/7 — проверьте, что это адрес Yggdrasil."
+            }
+        } catch { meshResult = error.localizedDescription }
     }
 
     private var identityIssue: String {

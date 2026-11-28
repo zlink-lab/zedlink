@@ -81,7 +81,8 @@ struct WorkspaceBreadcrumbMenu: View {
         Section {
             if let profile = session.profile {
                 Text(profile.name)
-                Text(profile.endpoint)
+                Text(session.activeEndpoint ?? profile.endpoint)
+                if profile.endpoints.count > 1, let route = session.activeRouteLabel { Text(route) }
             }
             Button("Manage connections", systemImage: "link") { session.showConnections = true }
         }

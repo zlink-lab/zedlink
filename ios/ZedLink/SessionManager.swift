@@ -154,6 +154,8 @@ import Network
     @Published private(set) var controlsIssue = ""
     @Published private(set) var notificationNeedsWorkspace = false
     @Published private(set) var pending: PendingSend?
+    /// Bumped when `EndpointSelection` switches the active address, so route labels redraw.
+    @Published private(set) var routeRevision = 0
     @Published var draft = "" {
         didSet {
             guard let profile, let selectedThreadID else { return }
@@ -2687,6 +2689,25 @@ import Network
             if pending != nil { delivery = "Previous send has uncertain delivery. Check its status before another send." }
         }
     }
+}
+
+// MARK: Wave 3: the active gateway address (main or mesh)
+
+extension SessionManager {
+    /// The configured address (main or mesh) requests of the current connection go to.
+    var activeEndpoint: String? {
+        _ = routeRevision
+        guard let profile else { return nil }
+        return EndpointSelection.shared.active(for: profile)
+    }
+
+    /// "через локалку" / "через mesh" for the current connection.
+    var activeRouteLabel: String? {
+        guard let profile, let endpoint = activeEndpoint else { return nil }
+        return profile.routeLabel(for: endpoint)
+    }
+
+    func endpointSelectionChanged() { routeRevision &+= 1 }
 }
 
 // MARK: Zed control (gateway-level `zed.status` / `zed.start` / `zed.restart`)

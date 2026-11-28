@@ -50,6 +50,13 @@ import SwiftUI
                 if requested { selectedTab = 2; session.showZedControl = false }
             }
             .modifier(ZedRestartDialog(session: session))
+            .onReceive(NotificationCenter.default.publisher(for: EndpointSelection.didChange)) { note in
+                // Main or mesh address: remember the one that passed the identity check last.
+                guard let raw = note.userInfo?["profile_id"] as? String, let id = UUID(uuidString: raw),
+                      let endpoint = note.userInfo?["endpoint"] as? String else { return }
+                profiles.recordWorkingEndpoint(profileID: id, endpoint: endpoint)
+                session.endpointSelectionChanged()
+            }
             .onChange(of: session.threads) { _, threads in
                 guard !session.demoPreview else { return }
                 summary.absorb(threads, profile: session.profile, targetID: session.targetID, hosts: session.workspaceHosts)

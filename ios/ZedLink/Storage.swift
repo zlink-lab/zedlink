@@ -53,6 +53,16 @@ import Combine
         value.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
     }
 
+    /// Stores which configured address (main or mesh) passed the identity check last, so the next
+    /// launch tries it first. Ignores addresses the profile no longer has.
+    func recordWorkingEndpoint(profileID: UUID, endpoint: String) {
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }),
+              profiles[index].endpoints.contains(endpoint),
+              profiles[index].lastWorkingEndpoint != endpoint else { return }
+        profiles[index].lastWorkingEndpoint = endpoint
+        persist()
+    }
+
     var preferredProfile: ConnectionProfile? {
         if let value = UserDefaults.standard.string(forKey: lastProfileKey),
            let id = UUID(uuidString: value),

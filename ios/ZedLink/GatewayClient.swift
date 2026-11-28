@@ -21,10 +21,43 @@ enum GatewayFailure: LocalizedError {
         ].contains(message)
     }
 
+    /// HTTPS identity (certificate) failure, as mapped in `GatewayClient.call`.
+    static let tlsFailureMessage = "HTTPS identity could not be verified. Check the hostname and certificate."
+
+    /// The address could not be reached at all (connect, timeout, TLS, no route), as opposed to an
+    /// answer from a gateway. Only these switch between a profile's two configured addresses.
+    static func isTransport(_ error: Error) -> Bool {
+        if let failure = error as? GatewayFailure {
+            if failure.isTransientRouteFailure { return true }
+            if case .native(let message) = failure { return message == tlsFailureMessage }
+            return false
+        }
+        if let error = error as? URLError { return error.code != .cancelled }
+        return false
+    }
+
+    /// A gateway that predates a gateway-local method answers HTTP 403 `UNSUPPORTED_CAPABILITY`.
+    static func isUnsupported(_ error: Error) -> Bool {
+        guard let failure = error as? GatewayFailure else { return false }
+        switch failure {
+        case .status(let status): return status == 403
+        case .native(let code):
+            return ["UNSUPPORTED_CAPABILITY", "UNKNOWN_METHOD", "METHOD_NOT_FOUND", "UNSUPPORTED_METHOD", "HTTP 403"].contains(code)
+        default: return false
+        }
+    }
+
     /// The thread exists but Zed has not loaded it (for example after a restart); `thread.open` recovers it.
     var isThreadNotLoaded: Bool {
         guard case .native(let code) = self else { return false }
         return code == "THREAD_NOT_LOADED" || code == "THREAD_NOT_EXPOSED"
+    }
+
+    /// The project is known but not open in Zed and cannot be served from disk (a closed SSH
+    /// project, wave 3 §6.3); `workspace.open` opens it.
+    var isProjectNotOpen: Bool {
+        guard case .native(let code) = self else { return false }
+        return code == "PROJECT_NOT_OPEN"
     }
 
     var errorDescription: String? {
@@ -46,8 +79,41 @@ enum GatewayFailure: LocalizedError {
             case "HOST_UNAVAILABLE": "Zed could not connect to that host. Check desktop Zed for a password prompt or error."
             case "INVALID_COMMAND": "Zed could not read that SSH command. Use the form ssh user@host -p 2222."
             case "UNSUPPORTED_CAPABILITY": "This action is not enabled in desktop Zed."
+            case "PROJECT_NOT_OPEN": "Проект не открыт в Zed (PROJECT_NOT_OPEN). Откройте его в Zed, чтобы работать с файлами."
             default: code
             }
+        }
+    }
+}
+
+/// Which configured address of each profile is in use, shared by every `GatewayClient` of the
+/// process. Changes are posted on the main queue so `ProfileStore` can store
+/// `lastWorkingEndpoint` and the UI can show the active route.
+final class EndpointSelection: @unchecked Sendable {
+    static let shared = EndpointSelection()
+    /// `userInfo`: `profile_id` (UUID string), `endpoint` (String).
+    static let didChange = Notification.Name("zedlink.endpointSelection.didChange")
+    private let lock = NSLock()
+    private var active: [UUID: String] = [:]
+
+    func active(for profile: ConnectionProfile) -> String {
+        lock.lock()
+        let value: String? = active[profile.id]
+        lock.unlock()
+        if let value, profile.endpoints.contains(value) { return value }
+        return profile.preferredEndpoint
+    }
+
+    func record(_ endpoint: String, for profile: ConnectionProfile) {
+        lock.lock()
+        let changed: Bool = active[profile.id] != endpoint
+        active[profile.id] = endpoint
+        lock.unlock()
+        // Only real switches (and the first check of a launch) are posted: every RPC records.
+        guard changed else { return }
+        let info: [String: String] = ["profile_id": profile.id.uuidString, "endpoint": endpoint]
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: EndpointSelection.didChange, object: nil, userInfo: info)
         }
     }
 }
@@ -72,28 +138,29 @@ struct GatewayClient {
     let token: String?
     var targetID: String? = nil
 
-    private var base: URL {
-        get throws {
-            guard let url = URL(string: profile.endpoint),
-                  let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-                  components.scheme == "https", components.host != nil,
-                  components.user == nil, components.password == nil,
-                  components.query == nil, components.fragment == nil else {
-                throw GatewayFailure.invalidEndpoint
-            }
-            return url
+    /// The address requests go to now (see `EndpointSelection`).
+    var activeEndpoint: String { EndpointSelection.shared.active(for: profile) }
+
+    private static func base(_ endpoint: String) throws -> URL {
+        guard let url = URL(string: endpoint),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme == "https", components.host != nil,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil else {
+            throw GatewayFailure.invalidEndpoint
         }
+        return url
     }
 
-    private func address(_ path: String) throws -> URL {
-        let root = try base.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    private static func address(_ path: String, at endpoint: String) throws -> URL {
+        let root = try base(endpoint).absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let result = URL(string: root + path) else { throw GatewayFailure.invalidEndpoint }
         return result
     }
 
-    private func call(_ path: String, payload: [String: Any]? = nil, authorized: Bool = false,
+    private func call(_ path: String, at endpoint: String, payload: [String: Any]? = nil, authorized: Bool = false,
                       method: String? = nil, freshTransport: Bool = false) async throws -> [String: Any] {
-        var request = URLRequest(url: try address(path))
+        var request = URLRequest(url: try Self.address(path, at: endpoint))
         request.timeoutInterval = freshTransport ? 20 : 12
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.httpMethod = method ?? (payload == nil ? "GET" : "POST")
@@ -129,7 +196,7 @@ struct GatewayClient {
             case .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
                  .serverCertificateHasBadDate, .serverCertificateNotYetValid,
                  .secureConnectionFailed:
-                throw GatewayFailure.native("HTTPS identity could not be verified. Check the hostname and certificate.")
+                throw GatewayFailure.native(GatewayFailure.tlsFailureMessage)
             default:
                 throw error
             }
@@ -151,21 +218,57 @@ struct GatewayClient {
         return object
     }
 
-    func gatewayID() async throws -> String {
-        let object = try await call("/v1/gateway", freshTransport: true)
+    /// The `gateway_id` at one exact address (the connection editor's "Test" buttons).
+    func gatewayID(at endpoint: String) async throws -> String {
+        let object = try await call("/v1/gateway", at: endpoint, freshTransport: true)
         guard object["version"] as? Int == 1, let id = object["gateway_id"] as? String else {
             throw GatewayFailure.invalidResponse
         }
         return id
     }
 
-    func verifyIdentity() async throws {
-        guard try await gatewayID() == profile.gatewayID else { throw GatewayFailure.changedIdentity }
+    /// The `gateway_id` at the active address, trying the other configured address only when the
+    /// first one cannot be reached at all.
+    func gatewayID() async throws -> String {
+        let first: String = activeEndpoint
+        do {
+            return try await gatewayID(at: first)
+        } catch let error where GatewayFailure.isTransport(error) {
+            guard let other = profile.endpoints.first(where: { $0 != first }) else { throw error }
+            do { return try await gatewayID(at: other) } catch let second where GatewayFailure.isTransport(second) { throw error }
+        }
+    }
+
+    /// Checks HTTPS and `gateway_id == profile.gatewayID` at the active address. On a transport
+    /// failure (never on an HTTP answer or a different gateway) the other configured address is
+    /// checked the same way. The address that passed becomes the active one and is returned.
+    /// Both are addresses the user saved for this gateway; there is no other fallback.
+    @discardableResult
+    func verifyIdentity() async throws -> String {
+        let first: String = activeEndpoint
+        do {
+            try await verifyIdentity(at: first)
+            EndpointSelection.shared.record(first, for: profile)
+            return first
+        } catch let error where GatewayFailure.isTransport(error) {
+            guard let other = profile.endpoints.first(where: { $0 != first }) else { throw error }
+            do {
+                try await verifyIdentity(at: other)
+            } catch let second where GatewayFailure.isTransport(second) {
+                throw error
+            }
+            EndpointSelection.shared.record(other, for: profile)
+            return other
+        }
+    }
+
+    private func verifyIdentity(at endpoint: String) async throws {
+        guard try await gatewayID(at: endpoint) == profile.gatewayID else { throw GatewayFailure.changedIdentity }
     }
 
     func pair(code: String, deviceName: String) async throws -> (deviceID: String, token: String) {
-        try await verifyIdentity()
-        let object = try await call("/v1/pair", payload: ["code": code, "device_name": deviceName])
+        let endpoint: String = try await verifyIdentity()
+        let object = try await call("/v1/pair", at: endpoint, payload: ["code": code, "device_name": deviceName])
         guard object["gateway_id"] as? String == profile.gatewayID,
               let deviceID = object["device_id"] as? String,
               let token = object["token"] as? String, token.count == 64 else {
@@ -176,10 +279,11 @@ struct GatewayClient {
 
     func rpc(_ method: String, params: [String: Any] = [:], requestID: String = UUID().uuidString) async throws -> [String: Any] {
         // Recheck before every authenticated call. A changed endpoint never receives the token.
-        try await verifyIdentity()
+        // The request itself is never retried on the other address: delivery stays unknown.
+        let endpoint: String = try await verifyIdentity()
         var envelope: [String: Any] = ["version": 1, "request_id": requestID, "method": method, "params": params]
         if method != "instance.list", let targetID { envelope["target_id"] = targetID }
-        let object = try await call("/v1/rpc", payload: envelope, authorized: true)
+        let object = try await call("/v1/rpc", at: endpoint, payload: envelope, authorized: true)
         guard object["version"] as? Int == 1, object["request_id"] as? String == requestID else {
             throw GatewayFailure.invalidResponse
         }
@@ -192,34 +296,35 @@ struct GatewayClient {
     }
 
     func apnsStatus() async throws -> (supported: Bool, enabled: Bool) {
-        try await verifyIdentity()
-        let result = try await call("/v1/notifications/apns", authorized: true)
+        let endpoint: String = try await verifyIdentity()
+        let result = try await call("/v1/notifications/apns", at: endpoint, authorized: true)
         guard let supported = result["supported"] as? Bool,
               let enabled = result["enabled"] as? Bool else { throw GatewayFailure.invalidResponse }
         return (supported, enabled)
     }
 
     func registerAPNs(token: String, environment: String) async throws {
-        try await verifyIdentity()
-        let result = try await call("/v1/notifications/apns", payload: ["token": token, "environment": environment], authorized: true)
+        let endpoint: String = try await verifyIdentity()
+        let result = try await call("/v1/notifications/apns", at: endpoint, payload: ["token": token, "environment": environment], authorized: true)
         guard result["enabled"] as? Bool == true else { throw GatewayFailure.invalidResponse }
     }
 
     func unregisterAPNs() async throws {
-        try await verifyIdentity()
-        let result = try await call("/v1/notifications/apns", authorized: true, method: "DELETE")
+        let endpoint: String = try await verifyIdentity()
+        let result = try await call("/v1/notifications/apns", at: endpoint, authorized: true, method: "DELETE")
         guard result["enabled"] as? Bool == false else { throw GatewayFailure.invalidResponse }
     }
 
     func testAPNs() async throws {
-        try await verifyIdentity()
-        let result = try await call("/v1/notifications/apns/test", payload: [:], authorized: true)
+        let endpoint: String = try await verifyIdentity()
+        let result = try await call("/v1/notifications/apns/test", at: endpoint, payload: [:], authorized: true)
         guard result["delivered"] as? Bool == true else { throw GatewayFailure.invalidResponse }
     }
 
     func eventStream(threadID: String, afterSequence: Int) throws -> AsyncThrowingStream<[String: Any], Error> {
         guard let token else { throw GatewayFailure.native("Pair this device first.") }
-        guard var components = URLComponents(string: profile.endpoint), components.scheme == "https" else {
+        // The address the last identity check passed on (every caller made an RPC before).
+        guard var components = URLComponents(string: activeEndpoint), components.scheme == "https" else {
             throw GatewayFailure.native("ZedLink requires trusted HTTPS.")
         }
         components.scheme = "wss"
