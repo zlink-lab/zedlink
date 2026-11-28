@@ -71,6 +71,13 @@ renames `~/.local/zed.app` → `~/.local/.zed.app.prev` and the staged copy into
 previous Zed back, starts it and marks the release `failed-<tag>` (not retried; `--tag` forces
 it). Either way the phone gets a push. Running turns are never interrupted for an update.
 
+A Zed already replaced on disk by other means (unpacked by hand, another updater) while the
+old one keeps running is handled the same way: when the running process's executable is no
+longer the file at `~/.local/zed.app/libexec/zed-editor`, the gateway restarts Zed into it once
+all threads have stopped (no swap, so no rollback; it first checks that `bin/zed --version`
+runs, and restarts into a given binary only once). Only a Zed started from that app directory
+is considered.
+
 `zed.status` → `update: {installed_tag, pending_tag, waiting, applying, last_result}`;
 `zed.update {"now": true}` skips the 3-minute settle once.
 

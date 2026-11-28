@@ -36,7 +36,7 @@ impl BridgeState {
 
 pub(super) struct BridgeCheck {
     pub(super) state: BridgeState,
-    pid: Option<i32>,
+    pub(super) pid: Option<i32>,
     info: Option<Value>,
 }
 

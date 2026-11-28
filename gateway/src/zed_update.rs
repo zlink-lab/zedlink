@@ -10,6 +10,7 @@
 
 use super::zed_control::{BridgeState, start_unit, systemctl};
 use super::*;
+use std::os::unix::fs::MetadataExt;
 
 const POLL: Duration = Duration::from_secs(30);
 const SETTLE: Duration = Duration::from_secs(3 * 60);
@@ -28,6 +29,13 @@ pub(super) struct Status {
     /// Skip the settle time once (`zed.update {"now": true}`).
     pub(super) now: bool,
     pub(super) last_result: Option<String>,
+}
+
+enum Plan {
+    /// `zed-zlink-update` staged a release next to the app.
+    Staged(Pending),
+    /// The app on disk is already newer than the running Zed (dev, inode of the new binary).
+    Restart { disk: (u64, u64) },
 }
 
 enum Applied {
@@ -238,32 +246,40 @@ impl Gateway {
         None
     }
 
+    /// The Zed binary on disk differs from the one the running Zed was started from (installed
+    /// by hand or by another tool while Zed ran). Returns the on-disk file's identity.
+    fn running_zed_outdated(check: &zed_control::BridgeCheck, app: &Path) -> Option<(u64, u64)> {
+        let pid = check.pid?;
+        let editor = app.join("libexec/zed-editor");
+        let running = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let running_path = running.to_string_lossy();
+        let running_path = running_path
+            .strip_suffix(" (deleted)")
+            .unwrap_or(&running_path);
+        // Only a Zed started from this app directory: a stock Zed elsewhere is not ours to update.
+        if Path::new(running_path) != fs::canonicalize(&editor).ok()?.as_path() {
+            return None;
+        }
+        let image = fs::metadata(format!("/proc/{pid}/exe")).ok()?;
+        let disk = fs::metadata(&editor).ok()?;
+        if !disk.is_file() || disk.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+        let disk_identity = (disk.dev(), disk.ino());
+        (disk_identity != (image.dev(), image.ino())).then_some(disk_identity)
+    }
+
     pub(super) async fn zed_update_loop(&self) {
         let (Some(directory), Some(app)) = (update_directory(), app_directory()) else {
             return;
         };
         let mut idle_since: Option<Instant> = None;
+        // A binary already on disk is restarted into once; if Zed still runs something else
+        // afterwards (started outside the unit), it is not retried in a loop.
+        let mut restarted_for: Option<(u64, u64)> = None;
         let mut interval = tokio::time::interval(POLL);
         loop {
             interval.tick().await;
-            let Some(pending) = read_pending(&directory) else {
-                idle_since = None;
-                self.set_update_status(|status| {
-                    status.pending_tag = None;
-                    status.waiting = None;
-                    status.now = false;
-                });
-                continue;
-            };
-            if !staged_path_is_expected(&pending, &app)
-                || directory.join(format!("failed-{}", pending.tag)).exists()
-            {
-                eprintln!("zed update: ignoring pending.json (unexpected path or failed release)");
-                fs::remove_file(directory.join("pending.json")).ok();
-                continue;
-            }
-            let tag = pending.tag.clone();
-            self.set_update_status(|status| status.pending_tag = Some(tag.clone()));
             let Some(target) = self
                 .0
                 .targets
@@ -271,13 +287,49 @@ impl Gateway {
                 .find(|target| target.zed_unit.is_some())
                 .cloned()
             else {
-                self.set_update_status(|status| status.waiting = Some("no_zed_control"));
                 continue;
             };
             if self.restart_in_progress(&target.id) {
                 continue;
             }
+            let pending = match read_pending(&directory) {
+                Some(pending)
+                    if !staged_path_is_expected(&pending, &app)
+                        || directory.join(format!("failed-{}", pending.tag)).exists() =>
+                {
+                    eprintln!(
+                        "zed update: ignoring pending.json (unexpected path or failed release)"
+                    );
+                    fs::remove_file(directory.join("pending.json")).ok();
+                    None
+                }
+                pending => pending,
+            };
             let check = self.check_bridge(&target).await;
+            let plan = match pending {
+                Some(pending) => Plan::Staged(pending),
+                None => match Self::running_zed_outdated(&check, &app)
+                    .filter(|disk| restarted_for != Some(*disk))
+                {
+                    Some(disk) => Plan::Restart { disk },
+                    None => {
+                        idle_since = None;
+                        self.set_update_status(|status| {
+                            status.pending_tag = None;
+                            status.waiting = None;
+                            status.now = false;
+                        });
+                        continue;
+                    }
+                },
+            };
+            let tag = match &plan {
+                Plan::Staged(pending) => pending.tag.clone(),
+                Plan::Restart { .. } => {
+                    installed_tag().unwrap_or_else(|| "новая версия на диске".to_owned())
+                }
+            };
+            self.set_update_status(|status| status.pending_tag = Some(tag.clone()));
             let blocker = match check.state {
                 BridgeState::Down => None,
                 BridgeState::Hung => Some("zed_hung"),
@@ -312,24 +364,36 @@ impl Gateway {
                 status.applying = true;
                 status.waiting = None;
             });
-            let outcome = self
-                .apply_update(&target, check, &pending, &app, &directory)
-                .await;
+            let outcome = match &plan {
+                Plan::Staged(pending) => {
+                    self.apply_update(&target, check, pending, &app, &directory)
+                        .await
+                }
+                Plan::Restart { disk } => {
+                    restarted_for = Some(*disk);
+                    self.restart_into_disk_zed(&target, check, &app).await
+                }
+            };
             if let Ok(mut restarts) = self.0.zed_restarts.lock() {
                 restarts.remove(&target.id);
             }
             if let Err(Applied::NotStarted(error)) = &outcome {
-                // Zed could not be stopped and nothing was swapped: try again on a later poll.
+                // Zed could not be stopped and nothing changed: try again on a later poll.
                 eprintln!("zed update: {tag} postponed: {error:#}");
+                if matches!(plan, Plan::Restart { .. }) {
+                    restarted_for = None;
+                }
                 self.set_update_status(|status| {
                     status.applying = false;
                     status.last_result = Some(format!("postponed {tag}"));
                 });
                 continue;
             }
-            fs::remove_file(directory.join("pending.json")).ok();
-            let (title, body, result) = match &outcome {
-                Ok(()) => {
+            if matches!(plan, Plan::Staged(_)) {
+                fs::remove_file(directory.join("pending.json")).ok();
+            }
+            let (title, body, result) = match (&outcome, &plan) {
+                (Ok(()), Plan::Staged(_)) => {
                     eprintln!("zed update: installed {tag} for target {}", target.id);
                     (
                         "Zed обновлён".to_owned(),
@@ -339,12 +403,34 @@ impl Gateway {
                         format!("installed {tag}"),
                     )
                 }
-                Err(Applied::NotStarted(error) | Applied::RolledBack(error)) => {
+                (Ok(()), Plan::Restart { .. }) => {
+                    eprintln!("zed update: restarted into the Zed on disk ({tag})");
+                    (
+                        "Zed перезапущен на новой версии".to_owned(),
+                        format!(
+                            "Запущен {tag}, уже лежавший на диске. Все треды были остановлены."
+                        ),
+                        format!("restarted {tag}"),
+                    )
+                }
+                (Err(Applied::NotStarted(error) | Applied::RolledBack(error)), Plan::Staged(_)) => {
                     eprintln!("zed update: {tag} failed: {error:#}");
                     (
                         "Обновление Zed не удалось".to_owned(),
                         format!("{tag} не запустился, оставлена прежняя версия."),
                         format!("failed {tag}"),
+                    )
+                }
+                (
+                    Err(Applied::NotStarted(error) | Applied::RolledBack(error)),
+                    Plan::Restart { .. },
+                ) => {
+                    eprintln!("zed update: restart into the Zed on disk failed: {error:#}");
+                    (
+                        "Zed не запустился".to_owned(),
+                        "Zed на диске не поднялся после перезапуска. Нужна проверка на компьютере."
+                            .to_owned(),
+                        format!("broken {tag}"),
                     )
                 }
             };
@@ -368,6 +454,40 @@ impl Gateway {
             })
             .await;
         }
+    }
+
+    /// Restart without a swap: the new Zed is already in place. There is no previous copy to
+    /// roll back to, so a Zed on disk that does not even report its version is left alone.
+    async fn restart_into_disk_zed(
+        &self,
+        target: &ProbeTarget,
+        check: zed_control::BridgeCheck,
+        app: &Path,
+    ) -> Result<(), Applied> {
+        let unit = target
+            .zed_unit
+            .clone()
+            .ok_or_else(|| Applied::NotStarted(anyhow::anyhow!("no Zed unit")))?;
+        let version = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::process::Command::new(app.join("bin/zed"))
+                .arg("--version")
+                .output(),
+        )
+        .await;
+        if !matches!(&version, Ok(Ok(output)) if output.status.success()) {
+            return Err(Applied::RolledBack(anyhow::anyhow!(
+                "the Zed on disk does not run `zed --version`; not restarting into it"
+            )));
+        }
+        self.stop_zed(target, check)
+            .await
+            .map_err(Applied::NotStarted)?;
+        let started = match start_unit(&unit).await {
+            Ok(()) => self.wait_for_bridge(target, START_LIMIT).await,
+            Err(error) => Err(error),
+        };
+        started.map_err(Applied::RolledBack)
     }
 
     async fn apply_update(
