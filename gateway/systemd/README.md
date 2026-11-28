@@ -58,7 +58,7 @@ connections for a few seconds; the app reconnects.
 
 ## Zed auto-update (planned for idle)
 
-`zed-zlink-update` (hourly timer) stages the newest `zed-v<version>-zlink.<n>` release: it
+`zed-zlink-update` (timer, every 10 minutes) stages the newest `zed-v<version>-zlink.<n>` release: it
 downloads it, checks the sha256 and `zed --version`, unpacks it to
 `~/.local/.zed.app.next-<tag>` and writes `~/.local/share/zedlink/zed/pending.json`. It never
 touches the running Zed.
