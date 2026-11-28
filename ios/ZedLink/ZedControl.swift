@@ -77,6 +77,8 @@ struct ZedUpdateStatus: Equatable {
         case "installed": return "Установлено обновление \(Self.short(parts[1]))."
         case "failed": return "Обновление \(Self.short(parts[1])) не запустилось, оставлена прежняя версия."
         case "postponed": return "Обновление \(Self.short(parts[1])) отложено: Zed не закрылся."
+        case "restarted": return "Zed перезапущен на версии с диска: \(Self.short(parts[1]))."
+        case "broken": return "Zed с диска (\(Self.short(parts[1]))) не запустился после перезапуска."
         default: return nil
         }
     }
