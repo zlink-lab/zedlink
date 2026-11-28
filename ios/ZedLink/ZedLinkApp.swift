@@ -50,6 +50,12 @@ import SwiftUI
                 dismissZedLinkKeyboard()
                 session.visibleStack = tab == 1 ? .summary : .sessions
             }
+            .onChange(of: session.workspaceRevealID) { _, reveal in
+                guard reveal != nil else { return }
+                dismissZedLinkKeyboard()
+                sessionsPath = []
+                selectedTab = 0
+            }
             .onChange(of: session.showConnections) { _, requested in
                 // Connections live in Settings › Connection & access.
                 if requested { sessionsPath = []; selectedTab = 2; showingConnections = true; session.showConnections = false }

@@ -31,7 +31,7 @@ enum SessionActivity: String, CaseIterable {
         pins = Set(defaults.stringArray(forKey: "zedlink.sessionPins") ?? [])
         recent = defaults.stringArray(forKey: "zedlink.sessionRecent") ?? []
     }
-    static func key(profile: String, target: String, thread: String) -> String {
+    nonisolated static func key(profile: String, target: String, thread: String) -> String {
         // Persist conversation identity, never connection epoch or transcript data.
         String(data: try! JSONEncoder().encode([profile, target, thread]), encoding: .utf8)!
     }

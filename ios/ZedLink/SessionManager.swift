@@ -152,6 +152,8 @@ import Network
     @Published var notificationThreadID: String?
     /// A thread to push on the Summary tab's stack (Summary rows and push taps, §6.7).
     @Published var summaryThreadID: String?
+    /// Changes when "go to workspace" narrowed the Sessions list; the app shows that list.
+    @Published private(set) var workspaceRevealID: UUID?
     /// The tab the user is on; a thread created from a conversation opens on that tab's stack.
     var visibleStack: ThreadDestination = .sessions
     /// The selected thread's project is not open in Zed (`PROJECT_NOT_OPEN`, closed SSH project):
@@ -2558,6 +2560,43 @@ import Network
         case .summary: summaryThreadID = threadID
         }
         return true
+    }
+
+    /// Connects to the thread's gateway and target if needed, narrows the Sessions list to the
+    /// thread's workspace and shows it.
+    func showWorkspace(of ref: ThreadRef, profiles: [ConnectionProfile]) async {
+        let sameGateway: Bool = profile?.gatewayID.caseInsensitiveCompare(ref.gatewayID) == .orderedSame
+        if !sameGateway || ref.targetID != targetID || state != .live {
+            let candidate: ConnectionProfile? = sameGateway ? profile
+                : profiles.first(where: { $0.gatewayID.caseInsensitiveCompare(ref.gatewayID) == .orderedSame })
+            guard let candidate else {
+                issue = "This thread belongs to a connection that is not saved on this iPhone."
+                workspaceRevealID = UUID()
+                return
+            }
+            if sameGateway && ref.targetID == targetID { await refresh() }
+            else { await connect(candidate, target: ref.targetID) }
+        }
+        if state == .live && supportsWorkspaces { await loadWorkspaces() }
+        let host: WorkspaceHost? = workspaceHosts.first(where: { host in
+            host.projects.contains(where: { project in
+                project.id == ref.projectID || project.threads.contains(where: { $0.id == ref.threadID })
+            })
+        }) ?? workspaceHosts.first(where: { $0.id == ref.hostID })
+        if let host {
+            let project: WorkspaceProject? = host.projects.first(where: { $0.id == ref.projectID })
+                ?? host.projects.first(where: { project in project.threads.contains(where: { $0.id == ref.threadID }) })
+            setWorkspaceFilter(WorkspaceFilter(hostID: host.id, hostLabel: host.label,
+                                               projectID: project?.id, projectName: project?.name))
+        } else if let hostID = ref.hostID, let projectID = ref.projectID {
+            // Without `workspace.list` the bridge's own ids still narrow the list.
+            setWorkspaceFilter(WorkspaceFilter(hostID: hostID, hostLabel: ref.hostLabel ?? hostID,
+                                               projectID: projectID, projectName: ref.workspaceLabel))
+        } else {
+            setWorkspaceFilter(nil)
+            issue = "The workspace of this thread is unknown to desktop Zed."
+        }
+        workspaceRevealID = UUID()
     }
 
     func respond(to approval: NativeApproval, with decision: NativeApprovalDecision) async {
