@@ -14,6 +14,7 @@ const ROLLOUT_TAIL: u64 = 256 * 1024;
 /// Day directories scanned for the newest rollout (a long session keeps writing to the file
 /// of the day it started).
 const ROLLOUT_DAYS: usize = 7;
+const ROLLOUT_FILES: usize = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(super) struct StoredWindow {
@@ -90,13 +91,14 @@ pub(super) fn bridge_observations(result: &Value) -> Vec<Observation> {
             continue;
         }
         let status = limit["status"].as_str().map(|status| bounded(status, 32));
-        // Without utilization the status still tells the threshold or a rejection.
+        // Without utilization the status still tells the threshold or a rejection. With
+        // neither, the usage is unknown and must not be shown as 0 %.
         let used_percent = match limit["utilization"].as_f64() {
             Some(value) => percent(value),
             None => match (status.as_deref(), limit["surpassed_threshold"].as_f64()) {
                 (Some("rejected"), _) => 100.0,
                 (_, Some(threshold)) => percent(threshold),
-                _ => 0.0,
+                _ => continue,
             },
         };
         let observed_at = row["observed_at_ms"]
@@ -205,8 +207,8 @@ fn numbered_dirs(path: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// The most recently modified rollout file among the newest day directories.
-pub(super) fn newest_rollout(sessions: &Path) -> Option<(PathBuf, SystemTime)> {
+/// The most recently modified rollout files among the newest day directories, newest first.
+pub(super) fn recent_rollouts(sessions: &Path) -> Vec<(PathBuf, SystemTime)> {
     let mut days = Vec::new();
     'years: for year in numbered_dirs(sessions) {
         for month in numbered_dirs(&year) {
@@ -218,7 +220,8 @@ pub(super) fn newest_rollout(sessions: &Path) -> Option<(PathBuf, SystemTime)> {
             }
         }
     }
-    days.iter()
+    let mut rollouts = days
+        .iter()
         .flat_map(|day| fs::read_dir(day).into_iter().flatten().flatten())
         .filter(|entry| {
             entry
@@ -232,7 +235,10 @@ pub(super) fn newest_rollout(sessions: &Path) -> Option<(PathBuf, SystemTime)> {
                 .is_file()
                 .then(|| Some((entry.path(), metadata.modified().ok()?)))?
         })
-        .max_by_key(|(_, modified)| *modified)
+        .collect::<Vec<_>>();
+    rollouts.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+    rollouts.truncate(ROLLOUT_FILES);
+    rollouts
 }
 
 pub(super) fn codex_sessions_dir() -> Option<PathBuf> {
@@ -243,8 +249,22 @@ pub(super) fn codex_sessions_dir() -> Option<PathBuf> {
     Some(home.join("sessions"))
 }
 
+/// The newest observation among the most recently written rollout files: the very newest
+/// one (a session that just started, or a sub-agent) may not hold any limits yet.
 pub(super) fn read_codex_limits(sessions: &Path) -> Option<Observation> {
-    let (path, modified) = newest_rollout(sessions)?;
+    recent_rollouts(sessions)
+        .into_iter()
+        .filter_map(|(path, modified)| read_rollout_limits(&path, modified))
+        .max_by_key(|observation| {
+            observation
+                .windows
+                .iter()
+                .map(|window| window.observed_at)
+                .max()
+        })
+}
+
+fn read_rollout_limits(path: &Path, modified: SystemTime) -> Option<Observation> {
     let mut file = fs::File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
     let start = length.saturating_sub(ROLLOUT_TAIL);
@@ -574,6 +594,13 @@ mod tests {
         fs::write(new_day.join("notes.txt"), "rate_limits")?;
         let observation = read_codex_limits(&root).context("no observation")?;
         assert_eq!(observation.windows[0].used_percent, 42.0);
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(
+            new_day.join("rollout-c.jsonl"),
+            "{\"type\":\"session_meta\"}\n",
+        )?;
+        let observation = read_codex_limits(&root).context("no observation")?;
+        assert_eq!(observation.windows[0].used_percent, 42.0);
         fs::remove_dir_all(&root)?;
         Ok(())
     }
@@ -584,7 +611,7 @@ mod tests {
         let Some(sessions) = codex_sessions_dir().filter(|path| path.is_dir()) else {
             return;
         };
-        if newest_rollout(&sessions).is_none() {
+        if recent_rollouts(&sessions).is_empty() {
             return;
         }
         if let Some(observation) = read_codex_limits(&sessions) {
@@ -606,6 +633,8 @@ mod tests {
             {"agent_id": "claude-acp", "agent_name": "Claude Agent", "thread_id": "t",
              "observed_at_ms": 1795780000000_i64,
              "rate_limit": {"status": "rejected", "rate_limit_type": "seven_day_opus"}},
+            {"agent_id": "claude-acp", "agent_name": "Claude Agent",
+             "rate_limit": {"status": "allowed", "rate_limit_type": "seven_day"}},
             {"agent_id": "gemini", "agent_name": "Gemini", "rate_limit": {"utilization": 5}}]});
         let observations = bridge_observations(&result);
         assert_eq!(observations.len(), 1);
@@ -616,6 +645,7 @@ mod tests {
         assert_eq!(claude.windows[0].observed_at, 1795780000);
         assert_eq!(claude.windows[1].kind, "seven_day_opus");
         assert_eq!(claude.windows[1].used_percent, 100.0);
+        assert_eq!(claude.windows.len(), 2, "unknown usage is not a 0 % window");
         assert_eq!(agent_key("codex-acp", "Codex"), Some("codex"));
         assert_eq!(agent_key("zed", "Zed Agent"), None);
     }
