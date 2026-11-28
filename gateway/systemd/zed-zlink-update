@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Stage the newest patched Zed release (zed-v<version>-zlink.<n>) for the gateway to install.
+
+This never touches the running Zed. It downloads the release, checks its sha256, unpacks it to
+<app parent>/.zed.app.next-<tag> (same filesystem as the app, so the swap is a rename) and
+writes ~/.local/share/zedlink/zed/pending.json. The gateway (zed_update) installs it when every
+thread has stopped, restarts Zed and rolls back if the new bridge does not come up.
+
+Installed release: <app>/.zlink-release (written here into the staged copy). A Zed installed
+by hand has no such file and is treated as older than any release.
+
+Usage: zed-zlink-update [--check] [--tag zed-v1.29.3-zlink.N]
+Env: ZEDLINK_REPOSITORY (zlink-lab/zedlink), ZEDLINK_ZED_APP (~/.local/zed.app),
+     ZEDLINK_ZED_UPDATE_DIR (~/.local/share/zedlink/zed).
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
+
+REPOSITORY = os.environ.get("ZEDLINK_REPOSITORY", "zlink-lab/zedlink")
+APP = Path(os.environ.get("ZEDLINK_ZED_APP", Path.home() / ".local/zed.app"))
+ROOT = Path(os.environ.get("ZEDLINK_ZED_UPDATE_DIR", Path.home() / ".local/share/zedlink/zed"))
+ARCHIVE = "zed-linux-x86_64.tar.gz"
+TAG = re.compile(r"^zed-v(\d+)\.(\d+)\.(\d+)-zlink\.(\d+)$")
+
+
+def log(message):
+    print(f"zed-zlink-update: {message}", flush=True)
+
+
+def fetch(url, limit):
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "zed-zlink-update", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=300) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise RuntimeError(f"response from {url} exceeds {limit} bytes")
+    return data
+
+
+def order(tag):
+    return tuple(int(part) for part in TAG.match(tag).groups())
+
+
+def releases():
+    data = json.loads(fetch(f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100", 8 << 20))
+    found = [release for release in data
+             if TAG.match(release.get("tag_name", "")) and not release.get("draft") and not release.get("prerelease")]
+    return sorted(found, key=lambda release: order(release["tag_name"]), reverse=True)
+
+
+def asset_url(release, name):
+    for asset in release.get("assets", []):
+        if asset.get("name") == name:
+            return asset["browser_download_url"]
+    raise RuntimeError(f"release {release['tag_name']} has no {name}")
+
+
+def installed_tag():
+    try:
+        tag = (APP / ".zlink-release").read_text().strip()
+    except OSError:
+        return None
+    return tag if TAG.match(tag) else None
+
+
+def staged_dir(tag):
+    return APP.parent / f".zed.app.next-{tag}"
+
+
+def write_pending(tag):
+    ROOT.mkdir(parents=True, exist_ok=True)
+    temporary = ROOT / "pending.json.new"
+    temporary.write_text(json.dumps({"tag": tag, "staged": str(staged_dir(tag))}))
+    os.replace(temporary, ROOT / "pending.json")
+
+
+def stage(release):
+    tag = release["tag_name"]
+    target = staged_dir(tag)
+    if (target / "libexec/zed-editor").is_file() and (target / ".zlink-release").read_text().strip() == tag:
+        return target
+    expected = fetch(asset_url(release, ARCHIVE + ".sha256"), 4096).decode().split()[0]
+    archive = fetch(asset_url(release, ARCHIVE), 1 << 30)
+    actual = hashlib.sha256(archive).hexdigest()
+    if actual != expected:
+        raise RuntimeError(f"checksum mismatch for {tag}: {actual} != {expected}")
+    staging = Path(tempfile.mkdtemp(prefix=f".zed.app.staging-{tag}.", dir=APP.parent))
+    try:
+        archive_path = staging / ARCHIVE
+        archive_path.write_bytes(archive)
+        del archive
+        with tarfile.open(archive_path) as bundle:
+            bundle.extractall(staging, filter="data")
+        unpacked = staging / "zed.app"
+        if not (unpacked / "libexec/zed-editor").is_file() or not (unpacked / "bin/zed").is_file():
+            raise RuntimeError(f"{tag}: archive has no zed.app/libexec/zed-editor")
+        version = subprocess.run([str(unpacked / "bin/zed"), "--version"], capture_output=True, text=True, timeout=20)
+        zed_version = ".".join(TAG.match(tag).groups()[:3])
+        if version.returncode != 0 or zed_version not in version.stdout:
+            raise RuntimeError(f"{tag}: zed --version reports {version.stdout.strip()!r}")
+        (unpacked / ".zlink-release").write_text(tag + "\n")
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(unpacked, target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return target
+
+
+def prune(keep):
+    for path in APP.parent.glob(".zed.app.next-*"):
+        if path.name != f".zed.app.next-{keep}":
+            shutil.rmtree(path, ignore_errors=True)
+    for path in APP.parent.glob(".zed.app.staging-*"):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--check", action="store_true", help="only report what would be staged")
+    parser.add_argument("--tag", help="stage this zed-v<version>-zlink.<n> instead of the newest")
+    options = parser.parse_args()
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with open(ROOT / ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("another update is running")
+            return 0
+        available = releases()
+        if options.tag:
+            available = [release for release in available if release["tag_name"] == options.tag]
+            if available:
+                (ROOT / f"failed-{options.tag}").unlink(missing_ok=True)
+        else:
+            available = [release for release in available if not (ROOT / f"failed-{release['tag_name']}").exists()]
+        if not available:
+            log("no usable Zed release found")
+            return 0
+        release = available[0]
+        tag = release["tag_name"]
+        installed = installed_tag()
+        if installed and not options.tag and order(installed) >= order(tag):
+            log(f"{installed} is installed")
+            prune(keep=None)
+            (ROOT / "pending.json").unlink(missing_ok=True)
+            return 0
+        if options.check:
+            log(f"would stage {tag} (installed: {installed or 'unknown'})")
+            return 0
+        stage(release)
+        write_pending(tag)
+        prune(keep=tag)
+        log(f"staged {tag} (installed: {installed or 'unknown'}); the gateway installs it once all threads stop")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

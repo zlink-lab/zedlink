@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for patched Zed releases hourly
+
+[Timer]
+OnBootSec=10min
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

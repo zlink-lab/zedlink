@@ -56,6 +56,36 @@ Check: `zedlink-gateway-update --check`, `journalctl --user -u zedlink-gateway-u
 `curl -sk https://<gateway>/v1/gateway` shows `build`. Updating the gateway drops phone
 connections for a few seconds; the app reconnects.
 
+## Zed auto-update (planned for idle)
+
+`zed-zlink-update` (hourly timer) stages the newest `zed-v<version>-zlink.<n>` release: it
+downloads it, checks the sha256 and `zed --version`, unpacks it to
+`~/.local/.zed.app.next-<tag>` and writes `~/.local/share/zedlink/zed/pending.json`. It never
+touches the running Zed.
+
+The gateway installs a staged release when Zed is idle: no thread Generating, none waiting for
+an approval or an input, no autopilot job due within 5 minutes, and that for 3 minutes in a
+row (a closed Zed is updated at once and not started). It then quits Zed like `zed.restart`,
+renames `~/.local/zed.app` → `~/.local/.zed.app.prev` and the staged copy into place, starts
+`zed-zlink.service` and waits 90 s for the bridge. If the bridge does not come up, it puts the
+previous Zed back, starts it and marks the release `failed-<tag>` (not retried; `--tag` forces
+it). Either way the phone gets a push. Running turns are never interrupted for an update.
+
+`zed.status` → `update: {installed_tag, pending_tag, waiting, applying, last_result}`;
+`zed.update {"now": true}` skips the 3-minute settle once.
+
+Needs Zed control (`ZEDLINK_ZED_UNIT` above). Install (once):
+
+```sh
+cp ~/.local/share/zedlink/gateway/release/current/systemd/zed-zlink-update.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now zed-zlink-update.timer
+```
+
+A Zed unpacked by hand has no `~/.local/zed.app/.zlink-release`, so the first run stages the
+newest release even if it is the one already installed (one extra restart, once). Env:
+`ZEDLINK_ZED_APP` (default `~/.local/zed.app`), `ZEDLINK_ZED_UPDATE_DIR`.
+
 ## Second address: Yggdrasil mesh
 
 The same gateway (same `gateway_id`, same pairing) can also listen on its Yggdrasil address

@@ -47,6 +47,7 @@ mod db;
 mod limits;
 mod unread;
 mod zed_control;
+mod zed_update;
 use web_push::{
     ContentEncoding, IsahcWebPushClient, SubscriptionInfo, Urgency, VapidSignatureBuilder,
     WebPushClient, WebPushError, WebPushMessageBuilder,
@@ -98,6 +99,7 @@ struct Inner {
     database: db::Database,
     limit_samples: std::sync::Mutex<limits::SampleMemory>,
     autopilot_runtime: std::sync::Mutex<autopilot::Runtime>,
+    zed_update: std::sync::Mutex<zed_update::Status>,
 }
 struct ApnsProvider {
     team_id: String,
@@ -224,6 +226,8 @@ enum NotificationEvent {
     ZedHung,
     /// Something the autopilot did or needs (always pushed, whoever drove the thread).
     Autopilot,
+    /// A staged Zed release was installed or rolled back (zed_update).
+    ZedUpdate,
 }
 
 impl NotificationEvent {
@@ -236,6 +240,7 @@ impl NotificationEvent {
             Self::Stopped(_) => "stopped",
             Self::ZedHung => "zed_hung",
             Self::Autopilot => "autopilot",
+            Self::ZedUpdate => "zed_update",
         }
     }
 }
@@ -346,6 +351,7 @@ fn push_body(event: NotificationEvent, snapshot: &Value) -> String {
         NotificationEvent::Stopped(reason) => format!("Остановлено: {reason}"),
         NotificationEvent::ZedHung => "Zed не отвечает".to_owned(),
         NotificationEvent::Autopilot => "Автопилот".to_owned(),
+        NotificationEvent::ZedUpdate => "Обновление Zed".to_owned(),
     }
 }
 
@@ -381,6 +387,13 @@ fn apns_payload(message: &PushMessage, gateway_id: &str, created: u64, badge: u6
         return json!({"aps": {"alert": alert, "sound": "default", "category": "ZEDLINK_ZED",
                 "thread-id": format!("zed:{}", message.target_id), "badge": badge},
             "type": "zed_hung", "event": message.event.kind(),
+            "gateway": gateway_id, "target": message.target_id, "created": created});
+    }
+    if message.event == NotificationEvent::ZedUpdate {
+        // No category: there is nothing to act on, a tap only opens the app.
+        return json!({"aps": {"alert": alert, "sound": "default",
+                "thread-id": format!("zed:{}", message.target_id), "badge": badge},
+            "type": "zed_update", "event": message.event.kind(),
             "gateway": gateway_id, "target": message.target_id, "created": created});
     }
     json!({"aps": {"alert": alert, "sound": "default", "category": "ZEDLINK_REVIEW",
@@ -692,6 +705,8 @@ async fn run_gateway(
     tokio::spawn(async move { notifications.notification_monitor().await });
     let watchdog = state.clone();
     tokio::spawn(async move { watchdog.zed_watchdog().await });
+    let updater = state.clone();
+    tokio::spawn(async move { updater.zed_update_loop().await });
     let limits = state.clone();
     tokio::spawn(async move { limits.limits_poller().await });
     let autopilot = state.clone();
@@ -1202,6 +1217,7 @@ impl Gateway {
             database,
             limit_samples: std::sync::Mutex::new(HashMap::new()),
             autopilot_runtime: std::sync::Mutex::new(autopilot::Runtime::default()),
+            zed_update: std::sync::Mutex::new(zed_update::Status::default()),
         })))
     }
     /// Applies `change` to a copy of the persisted state and saves it; the in-memory state
@@ -2566,6 +2582,7 @@ fn allowed_rpc_method(method: &str) -> bool {
             | "zed.status"
             | "zed.start"
             | "zed.restart"
+            | "zed.update"
             | "project.directory"
             | "project.file"
             | "project.search"

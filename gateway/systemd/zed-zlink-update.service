@@ -1,0 +1,9 @@
+[Unit]
+Description=Stage the newest patched Zed release for the ZedLink gateway to install
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Only downloads and unpacks next to ~/.local/zed.app; the gateway installs it when every
+# thread has stopped (gateway/src/zed_update.rs).
+ExecStart=/usr/bin/python3 -I %h/.local/share/zedlink/gateway/release/current/systemd/zed-zlink-update

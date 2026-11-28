@@ -125,7 +125,7 @@ async fn wait_for_exit(pid: i32, limit: Duration) -> bool {
     !process_alive(pid)
 }
 
-async fn systemctl(verb: &str, unit: &str) -> Result<(bool, String)> {
+pub(super) async fn systemctl(verb: &str, unit: &str) -> Result<(bool, String)> {
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new("systemctl")
@@ -225,14 +225,14 @@ impl Gateway {
             .unwrap_or(0)
     }
 
-    fn restart_in_progress(&self, target_id: &str) -> bool {
+    pub(super) fn restart_in_progress(&self, target_id: &str) -> bool {
         self.0
             .zed_restarts
             .lock()
             .is_ok_and(|restarts| restarts.contains(target_id))
     }
 
-    /// `zed.status`, `zed.start`, `zed.restart`. Errors use the bridge's `{code}` shape.
+    /// `zed.status`, `zed.start`, `zed.restart`, `zed.update`. Errors use the bridge's `{code}` shape.
     pub(super) async fn zed_rpc(
         &self,
         method: &str,
@@ -244,6 +244,8 @@ impl Gateway {
         };
         match method {
             "zed.status" => (StatusCode::OK, Ok(self.zed_status(&target).await)),
+            "zed.update" if params["now"] == true => self.zed_update_now(),
+            "zed.update" => (StatusCode::OK, Ok(self.zed_update_status())),
             "zed.start" => self.zed_start(&target).await,
             "zed.restart" => {
                 let force = params["force"].as_bool().unwrap_or(false);
@@ -281,6 +283,7 @@ impl Gateway {
             "epoch": check.info.as_ref().map(|info| info["epoch"].clone()),
             "generating": generating,
             "restarting": self.restart_in_progress(&target.id),
+            "update": target.zed_unit.as_ref().map(|_| self.zed_update_status()),
         })
     }
 
@@ -360,6 +363,28 @@ impl Gateway {
         unit: &str,
         check: BridgeCheck,
     ) -> Result<()> {
+        self.stop_zed(target, check).await?;
+        start_unit(unit).await?;
+        self.wait_for_bridge(target, START_WAIT).await
+    }
+
+    pub(super) async fn wait_for_bridge(
+        &self,
+        target: &ProbeTarget,
+        limit: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if self.check_bridge(target).await.state == BridgeState::Up {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        bail!("bridge did not come back within {}s", limit.as_secs())
+    }
+
+    /// Quits Zed through `instance.quit` when the bridge offers it, else by signals.
+    pub(super) async fn stop_zed(&self, target: &ProbeTarget, check: BridgeCheck) -> Result<()> {
         if let Some(pid) = check.pid.filter(|pid| is_own_zed_process(*pid)) {
             let can_quit = check.info.as_ref().is_some_and(|info| {
                 info["capabilities"].as_array().is_some_and(|capabilities| {
@@ -391,15 +416,7 @@ impl Gateway {
         } else if check.state != BridgeState::Down {
             bail!("Zed is running but its process could not be identified");
         }
-        start_unit(unit).await?;
-        let deadline = Instant::now() + START_WAIT;
-        while Instant::now() < deadline {
-            if self.check_bridge(target).await.state == BridgeState::Up {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        bail!("bridge did not come back within {}s", START_WAIT.as_secs())
+        Ok(())
     }
 
     /// Pushes once per outage when a running Zed stops answering. A closed Zed is not an
@@ -462,7 +479,7 @@ impl Gateway {
     }
 }
 
-async fn start_unit(unit: &str) -> Result<()> {
+pub(super) async fn start_unit(unit: &str) -> Result<()> {
     // A unit whose Zed was killed is "failed"; start would refuse it otherwise.
     systemctl("reset-failed", unit).await.ok();
     let (started, _) = systemctl("start", unit).await?;
