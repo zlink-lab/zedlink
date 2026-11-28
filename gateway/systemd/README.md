@@ -132,3 +132,16 @@ approves tools.
 History lives in `<state>/zedlink.sqlite` (WAL, kept 400 days): per-turn token counts, limit
 samples and the autopilot log — ids, numbers and short codes only, no message text or titles.
 Deleting the file loses the history only; it is recreated on the next start.
+
+## Codex limits from an SSH host
+
+Codex running on an SSH host keeps its rollout files there. The gateway therefore also asks
+the agent: it creates one thread "ZLink: лимиты Codex" in the (preferably remote) project
+where a Codex thread was last listed, sends `/status` (answered by codex-acp itself, no model
+call) and parses the limit lines. It asks when the phone requests `limits.list` (at most every
+2 minutes; the new value shows on the next request) and every 10 minutes while a Codex turn
+runs. The thread is hidden from the phone and gets no pushes or autopilot; Zed shows it, and
+creating it selects it in the agent panel once. It needs thread creation to be allowed in the
+`zedlink` settings and the project open in Zed. Reset times are read in the gateway's time
+zone. `ZEDLINK_CODEX_STATUS=0` turns this off.
+

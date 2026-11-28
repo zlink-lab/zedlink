@@ -684,7 +684,7 @@ fn agent_of(snapshot: &Value) -> Option<&'static str> {
 }
 
 impl Gateway {
-    async fn native_call(
+    pub(super) async fn native_call(
         &self,
         target_id: &str,
         method: &str,

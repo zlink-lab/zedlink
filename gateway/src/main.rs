@@ -43,6 +43,7 @@ use tokio::{
 use uuid::Uuid;
 
 mod autopilot;
+mod codex_status;
 mod db;
 mod limits;
 mod unread;
@@ -100,6 +101,7 @@ struct Inner {
     limit_samples: std::sync::Mutex<limits::SampleMemory>,
     autopilot_runtime: std::sync::Mutex<autopilot::Runtime>,
     zed_update: std::sync::Mutex<zed_update::Status>,
+    codex_status_runtime: std::sync::Mutex<codex_status::Runtime>,
 }
 struct ApnsProvider {
     team_id: String,
@@ -136,6 +138,8 @@ struct Persisted {
     unread: unread::UnreadState,
     #[serde(default)]
     autopilot: autopilot::AutopilotState,
+    #[serde(default)]
+    codex_status: codex_status::State,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ApnsDevice {
@@ -1186,6 +1190,7 @@ impl Gateway {
                 limits: Default::default(),
                 unread: Default::default(),
                 autopilot: Default::default(),
+                codex_status: Default::default(),
             };
             save(&directory, &initial)?;
             initial
@@ -1218,6 +1223,7 @@ impl Gateway {
             limit_samples: std::sync::Mutex::new(HashMap::new()),
             autopilot_runtime: std::sync::Mutex::new(autopilot::Runtime::default()),
             zed_update: std::sync::Mutex::new(zed_update::Status::default()),
+            codex_status_runtime: std::sync::Mutex::new(codex_status::Runtime::default()),
         })))
     }
     /// Applies `change` to a copy of the persisted state and saves it; the in-memory state
@@ -1741,10 +1747,15 @@ impl Gateway {
                     continue;
                 };
                 current.retain(|key, _| !key.starts_with(&format!("{}:", target.id)));
+                self.codex_status_seen(&target.id, threads).await;
                 for thread in threads {
                     let Some(thread_id) = thread["thread_id"].as_str() else {
                         continue;
                     };
+                    // No pushes, unread counts or autopilot for the limits service thread.
+                    if self.is_service_thread(thread_id).await {
+                        continue;
+                    }
                     let key = format!("{}:{instance}:{epoch}:{thread_id}", target.id);
                     if let Some(observation) = self
                         .observe_thread(target, instance, epoch, thread, thread_id, prior.get(&key))
@@ -2889,6 +2900,7 @@ async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> i
             "target": {"target_id": target_id, "label": target.label, "available": true},
             "threads": list["threads"], "snapshot": snapshot, "pending_status": pending_status,
         });
+        state.hide_service_threads(&mut result).await;
         // Leave room for the RPC envelope inside the client's 4 MiB response cap.
         let max_result_size = MAX_PROBE_RESPONSE as usize - 512;
         if serde_json::to_vec(&result).is_ok_and(|body| body.len() > max_result_size) {
@@ -2971,6 +2983,13 @@ async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> i
             {
                 state.set_remote_thread(&target.id, thread_id, true).await;
                 state.autopilot_exempt_turns(&target.id, thread_id);
+            }
+            if matches!(
+                method.as_str(),
+                "thread.list" | "workspace.list" | "thread.history"
+            ) && let Some(result) = response.get_mut("result")
+            {
+                state.hide_service_threads(result).await;
             }
             response["request_id"] = json!(original_request_id);
             (StatusCode::OK, Json(response))

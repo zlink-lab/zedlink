@@ -486,6 +486,8 @@ impl Gateway {
 
     pub(super) async fn limits_list(&self) -> Value {
         self.refresh_limits(false).await;
+        // Answers with what is known; a newer Codex value arrives on the next request.
+        self.codex_status_on_demand();
         limits_report(&self.0.persisted.lock().await.limits, now_seconds())
     }
 
