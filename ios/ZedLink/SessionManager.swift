@@ -1723,10 +1723,11 @@ import Network
             try checkIdentity(info)
             capabilities = Set(info["capabilities"] as? [String] ?? [])
             let base: [String: Any] = ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": threadID]
+            let fileBase: [String: Any] = ["instance_id": instanceID ?? "", "epoch": epoch ?? ""]
             if page == nil || page == .files {
                 if capabilities.contains("project.files") {
                     do {
-                        let result = try await client.rpc("project.files", params: base)
+                        let result = try await projectRPC(client, "project.files", threadID: threadID, params: fileBase)
                         guard current() else { return }
                         projectNotOpen = false
                         projectFilesTruncated = result["truncated"] as? Bool ?? false
@@ -2143,13 +2144,30 @@ import Network
         return hostID
     }
 
+    /// Project file requests name the thread. A saved thread of a project that is closed in Zed is
+    /// not loaded (`THREAD_NOT_LOADED`), so the request is retried by `project_id`, which the
+    /// bridge serves from disk for closed local projects (wave 3 §6.3).
+    private func projectRPC(_ client: GatewayClient, _ method: String, threadID: String, params: [String: Any]) async throws -> [String: Any] {
+        var withThread = params
+        withThread["thread_id"] = threadID
+        do {
+            return try await client.rpc(method, params: withThread)
+        } catch let error as GatewayFailure where error.isThreadNotLoaded {
+            let projectID = threads.first(where: { $0.id == threadID })?.projectID ?? historyThread(threadID)?.projectID
+            guard let projectID, !projectID.isEmpty else { throw error }
+            var withProject = params
+            withProject["project_id"] = projectID
+            return try await client.rpc(method, params: withProject)
+        }
+    }
+
     func loadDirectory(_ path: String) async {
         projectFolderEntries = nil; projectFolderTruncated = false
         guard capabilities.contains("project.directory"), let client, let thread = selectedThreadID else { return }
         let request = UUID(); directoryRequest = request
         let scope = (profile?.id, targetID, instanceID, epoch)
         do {
-            let result = try await client.rpc("project.directory", params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": thread, "path": path])
+            let result = try await projectRPC(client, "project.directory", threadID: thread, params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "path": path])
             guard request == directoryRequest, thread == selectedThreadID, scope.0 == profile?.id,
                   scope.1 == targetID, scope.2 == instanceID, scope.3 == epoch else { return }
             guard result["directory"] as? String == path, let rows = result["entries"] as? [[String: Any]] else { throw GatewayFailure.invalidResponse }
@@ -2172,7 +2190,7 @@ import Network
         let scope = (profile?.id, targetID, instanceID, epoch, threadID)
         previewTitle = path; previewContent = ""; previewReadable = false; previewLoading = true; previewTruncated = false
         do {
-            let result = try await client.rpc("project.file", params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": threadID, "path": path])
+            let result = try await projectRPC(client, "project.file", threadID: threadID, params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "path": path])
             guard request == previewRequest, scope.0 == profile?.id, scope.1 == targetID,
                   scope.2 == instanceID, scope.3 == epoch, scope.4 == selectedThreadID else { return }
             guard result["path"] as? String == path, let content = result["content"] as? String else {
@@ -2221,7 +2239,7 @@ import Network
         let scope = operationScope; let request = UUID(); searchRequest = request
         for _ in 0..<40 {
             try Task.checkCancellation()
-            let result = try await client.rpc("project.search", params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": thread, "query": query, "case_sensitive": false])
+            let result = try await projectRPC(client, "project.search", threadID: thread, params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "query": query, "case_sensitive": false])
             guard scope == operationScope, searchRequest == request else { throw CancellationError() }
             if result["outcome"] as? String == "ready" {
                 let matches = (result["matches"] as? [[String: Any]] ?? []).compactMap { row -> ProjectSearchMatch? in
