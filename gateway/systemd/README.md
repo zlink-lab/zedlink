@@ -82,3 +82,16 @@ authorization — reachability over the mesh grants nothing by itself. The phone
 "Mesh-адрес" and uses whichever of the two addresses answers with the expected `gateway_id`.
 `reload-tls` reloads both certificates.
 
+## Autopilot, unread counters and history
+
+The gateway polls every exposed thread every 2 s (whether or not a phone subscribed to pushes)
+and the agents' subscription limits every 2 min (bridge `agent.limits`, and the newest
+`$CODEX_HOME/sessions/**/rollout-*.jsonl` tail for Codex). Autopilot is on for every thread by
+default (Settings → Автопилот on the phone, or `/auto off` in a thread): it continues threads
+that stopped on a usage limit, `max_turn_requests` or a stall, holds automatic continues at
+≥ 95 % with a reset more than an hour away, and cancels running turns at ≥ 98 %. It never
+approves tools.
+
+History lives in `<state>/zedlink.sqlite` (WAL, kept 400 days): per-turn token counts, limit
+samples and the autopilot log — ids, numbers and short codes only, no message text or titles.
+Deleting the file loses the history only; it is recreated on the next start.
