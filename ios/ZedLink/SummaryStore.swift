@@ -181,6 +181,10 @@ struct SummaryEntry: Codable, Identifiable, Equatable {
             entry.status = status
             fresh[threadID] = entry
         }
+        // A pinned thread stays even when Zed no longer lists it.
+        for (threadID, entry) in previous where fresh[threadID] == nil && Self.isPinned(entry) {
+            fresh[threadID] = entry
+        }
         entries.removeAll { $0.gatewayID.lowercased() == gatewayID.lowercased() && $0.targetID == targetID }
         entries.append(contentsOf: fresh.values)
         normalize()
@@ -225,9 +229,21 @@ struct SummaryEntry: Codable, Identifiable, Equatable {
 
     private func normalize() {
         let now = Date()
-        entries.removeAll { now.timeIntervalSince($0.updatedAt) > keepFor }
+        entries.removeAll { now.timeIntervalSince($0.updatedAt) > keepFor && !Self.isPinned($0) }
         entries.sort { $0.updatedAt > $1.updatedAt }
-        if entries.count > maxEntries { entries.removeLast(entries.count - maxEntries) }
+        if entries.count > maxEntries {
+            var excess: Int = entries.count - maxEntries
+            for index in entries.indices.reversed() where excess > 0 && !Self.isPinned(entries[index]) {
+                entries.remove(at: index)
+                excess -= 1
+            }
+        }
+    }
+
+    /// Reads the pins `SessionLibrary` stores.
+    private static func isPinned(_ entry: SummaryEntry) -> Bool {
+        let key: String = SessionLibrary.key(profile: entry.gatewayID, target: entry.targetID, thread: entry.threadID)
+        return (UserDefaults.standard.stringArray(forKey: "zedlink.sessionPins") ?? []).contains(key)
     }
 
     private func save() {

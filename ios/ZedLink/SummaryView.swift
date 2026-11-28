@@ -16,6 +16,8 @@ struct SummaryView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var summary: SummaryStore
     @EnvironmentObject private var extras: GatewayExtrasStore
+    @EnvironmentObject private var library: SessionLibrary
+    @State private var infoThread: ThreadRef?
     @Binding var path: [SummaryRoute]
     @State private var search = ""
     @State private var historyLimit = 40
@@ -29,14 +31,18 @@ struct SummaryView: View {
         summary.entries.filter { search.isEmpty || $0.searchText.localizedCaseInsensitiveContains(search) }
     }
 
+    private func isPinned(_ entry: SummaryEntry) -> Bool { library.pins.contains(ThreadRef(entry: entry).pinKey) }
+
+    private var pinned: [SummaryEntry] { matching.filter { isPinned($0) } }
+
     private var recent: [SummaryEntry] {
         let now = Date()
-        return matching.filter { now.timeIntervalSince($0.updatedAt) <= recentWindow }
+        return matching.filter { now.timeIntervalSince($0.updatedAt) <= recentWindow && !isPinned($0) }
     }
 
     private var history: [SummaryEntry] {
         let now = Date()
-        return matching.filter { now.timeIntervalSince($0.updatedAt) > recentWindow }
+        return matching.filter { now.timeIntervalSince($0.updatedAt) > recentWindow && !isPinned($0) }
     }
 
     var body: some View {
@@ -44,12 +50,14 @@ struct SummaryView: View {
             List {
                 limitsSection
                 statusSection
+                pinnedSection
                 AutopilotSummarySection()
                 statisticsLink
                 recentSection
                 historySection
             }
             .listStyle(.plain).scrollContentBackground(.hidden).background(ZLTheme.background)
+            .sheet(item: $infoThread) { ThreadInfoSheet(ref: $0) }
             .searchable(text: $search, prompt: "Search all connections")
             .navigationTitle("Сводка").navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -132,6 +140,15 @@ struct SummaryView: View {
         }
     }
 
+    @ViewBuilder private var pinnedSection: some View {
+        let rows: [SummaryEntry] = pinned
+        if !rows.isEmpty {
+            Section {
+                ForEach(rows) { entry in row(entry) }
+            } header: { SectionLabel("Закреплённые · \(rows.count)") }
+        }
+    }
+
     @ViewBuilder private var recentSection: some View {
         let rows: [SummaryEntry] = recent
         if !rows.isEmpty {
@@ -163,6 +180,7 @@ struct SummaryView: View {
             .disabled(opening != nil)
             .listRowBackground(ZLTheme.background)
             .accessibilityIdentifier("summary-thread-" + entry.threadID)
+            .threadActions(ThreadRef(entry: entry), info: $infoThread)
     }
 
     /// Opens the thread on this tab's stack (`summaryThreadID`), so back returns to Summary.

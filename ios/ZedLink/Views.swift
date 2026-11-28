@@ -19,6 +19,7 @@ struct SessionsView: View {
     @State private var workspaceThreadID: String?
     @State private var createdThreadID: String?
     @State private var historyLimit = 30
+    @State private var infoThread: ThreadRef?
     @Binding var navigationPath: [String]
     private let groups = ["Needs attention", "Running"]
     private let recentWindow: TimeInterval = 3 * 24 * 60 * 60
@@ -54,6 +55,8 @@ struct SessionsView: View {
     var body: some View {
         NavigationStack(path: $navigationPath) {
             sessionsList
+                .sheet(item: $infoThread) { ThreadInfoSheet(ref: $0) }
+                .onChange(of: session.workspaceRevealID) { _, _ in filter = "All"; search = "" }
                 .sheet(isPresented: $showingWorkspaces, onDismiss: { openWorkspaceThread() }) {
                     WorkspacesView(openedThreadID: $workspaceThreadID)
                 }
@@ -221,6 +224,7 @@ struct SessionsView: View {
                 HistoryThreadRow(item: item, agent: session.agentDisplayName(item.thread.agent))
             }.buttonStyle(.plain).disabled(session.workspaceProgress != nil || session.recoveringThreadID != nil)
                 .accessibilityIdentifier("recent-thread-" + item.id)
+                .threadActions(historyRef(item), info: $infoThread)
         }
         Hairline().padding(.leading, 16)
     }
@@ -272,6 +276,16 @@ struct SessionsView: View {
         }.buttonStyle(.plain).accessibilityIdentifier("thread-" + thread.id)
             .allowsHitTesting(!session.demoPreview)
             .simultaneousGesture(TapGesture().onEnded { dismissZedLinkKeyboard(); library.opened(key(thread)) })
+            .threadActions(session.threadRef(thread.id), info: $infoThread)
+    }
+
+    private func historyRef(_ item: RecentHistoryThread) -> ThreadRef? {
+        guard let profile = session.profile, let targetID = session.targetID else { return nil }
+        return ThreadRef(gatewayID: profile.gatewayID, targetID: targetID, threadID: item.id,
+                         title: item.thread.title ?? "Untitled thread", connectionName: profile.name,
+                         hostID: item.hostID, hostLabel: item.hostLabel, projectID: item.projectID,
+                         workspaceLabel: item.project, agent: session.agentDisplayName(item.thread.agent),
+                         updated: item.thread.updatedAt)
     }
 
     @ViewBuilder private var recentSection: some View {
@@ -594,6 +608,8 @@ private struct SessionRow: View {
     @State private var lastKnownTitle = ""
     @State private var showingModelControls = false
     @State private var showingSendLater = false
+    @State private var infoThread: ThreadRef?
+    @EnvironmentObject private var profiles: ProfileStore
     @State private var selectedElicitationID: String?
     @State private var showingConversationSearch = false
     @State private var showingAgentErrorDetails = false
@@ -834,6 +850,7 @@ private struct SessionRow: View {
         }
         .sheet(isPresented: $showingModelControls) { SessionModelControls() }
         .sheet(isPresented: $showingSendLater) { sendLaterSheet }
+        .sheet(item: $infoThread) { ThreadInfoSheet(ref: $0) }
         .sheet(isPresented: Binding(get: { selectedElicitationID != nil }, set: { if !$0 { selectedElicitationID = nil } })) {
             NavigationStack {
                 ScrollView {
@@ -1022,8 +1039,16 @@ private struct SessionRow: View {
             Text(lastKnownTitle.isEmpty ? "Agent thread" : lastKnownTitle)
                 .font(.headline).lineLimit(2)
             if let place = session.placeLabel(for: threadID) {
-                Text(place).font(.caption).foregroundStyle(ZLTheme.muted).lineLimit(1)
-                    .accessibilityIdentifier("conversation-place")
+                Button { showThreadWorkspace() } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder")
+                        Text(place).lineLimit(1)
+                    }
+                    .font(.caption).foregroundStyle(ZLTheme.muted)
+                }
+                .buttonStyle(.plain).disabled(session.demoPreview)
+                .accessibilityHint("Перейти в воркспейс")
+                .accessibilityIdentifier("conversation-place")
             }
             if session.state != .live { ConnectionStatusView(state: session.state) }
             if session.state == .live && !session.controlsIssue.isEmpty {
@@ -1059,6 +1084,12 @@ private struct SessionRow: View {
         }.accessibilityIdentifier("conversation-title")
     }
 
+    private func showThreadWorkspace() {
+        guard let ref = session.threadRef(threadID) else { return }
+        composerFocused = false
+        Task { await session.showWorkspace(of: ref, profiles: profiles.profiles) }
+    }
+
     private var workspaceButton: some View {
         Button { composerFocused = false; contextInitialTab = .files; showingContext = true } label: {
             Image(systemName: "square.grid.2x2").frame(width: 44, height: 44)
@@ -1079,6 +1110,14 @@ private struct SessionRow: View {
                 Button("Retry session controls", systemImage: "arrow.clockwise") {
                     Task { await session.refreshSessionControls() }
                 }
+            }
+            Button("Перейти в воркспейс", systemImage: "folder") { showThreadWorkspace() }
+                .disabled(session.demoPreview || session.profile == nil)
+            if let ref = session.threadRef(threadID) {
+                Button(library.pins.contains(ref.pinKey) ? "Открепить" : "Закрепить", systemImage: "pin") {
+                    library.toggle(ref.pinKey)
+                }
+                Button("Параметры треда", systemImage: "info.circle") { composerFocused = false; infoThread = ref }
             }
             Button("Find in conversation", systemImage: "magnifyingglass") { showingConversationSearch = true }
             if !session.delivery.isEmpty { Menu("Recent delivery status") { Text(session.delivery) } }
