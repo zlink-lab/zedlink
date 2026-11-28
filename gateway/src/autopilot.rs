@@ -1303,7 +1303,10 @@ impl Gateway {
             }
             return defer(NOT_READY_DEFER, "deferred", "waiting_user");
         }
-        if snapshot["status"] != "Idle" || !snapshot["current_turn_id"].is_null() {
+        // A message the user scheduled goes in anyway (a busy thread queues it) and is not
+        // subject to the budget hold or the daily limit: those restrain automatic actions.
+        let by_user = job.reason == "user";
+        if !by_user && (snapshot["status"] != "Idle" || !snapshot["current_turn_id"].is_null()) {
             return defer(NOT_READY_DEFER, "deferred", "busy");
         }
 
@@ -1320,12 +1323,14 @@ impl Gateway {
             if holding_until(&windows, now, settings.hold_percent).is_none() {
                 return drop_job("skipped", "no_hold", None);
             }
-        } else if let Some(reset) = hold_until(
-            &windows,
-            now,
-            settings.hold_percent,
-            settings.hold_min_reset_minutes,
-        ) {
+        } else if !by_user
+            && let Some(reset) = hold_until(
+                &windows,
+                now,
+                settings.hold_percent,
+                settings.hold_min_reset_minutes,
+            )
+        {
             if settings.warm_enabled {
                 let warm_text = settings.warm_text.clone();
                 self.mutate_persisted(|state| {
@@ -1374,7 +1379,7 @@ impl Gateway {
                 (over, notify)
             })
             .await;
-        if over_limit {
+        if over_limit && !by_user {
             return drop_job(
                 "skipped",
                 "daily_limit",
@@ -1383,7 +1388,7 @@ impl Gateway {
         }
 
         // Step 6: send, as the phone would.
-        if job.kind == "warm" {
+        if job.kind == "warm" || by_user {
             self.autopilot_exempt_turns(&target.id, &job.thread_id);
         }
         let sent = self
