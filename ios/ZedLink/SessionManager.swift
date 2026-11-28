@@ -106,10 +106,11 @@ import Network
         guard file.data.count <= ProjectUploader.maxBytes else { issue = "Files can be up to 25 MiB."; return }
         let id = UUID()
         uploads.append(ComposerUpload(id: id, name: file.fileName, mimeType: file.mimeType, size: file.data.count))
+        let projectID: String? = threads.first(where: { $0.id == threadID })?.projectID ?? historyThread(threadID)?.projectID
         uploadTasks[id] = Task { [weak self] in
             do {
                 let committed: CommittedUpload = try await ProjectUploader.upload(
-                    client: client, instanceID: instanceID, epoch: epoch, threadID: threadID, projectID: nil, file: file
+                    client: client, instanceID: instanceID, epoch: epoch, threadID: threadID, projectID: projectID, file: file
                 ) { fraction in
                     guard let self, let index = self.uploads.firstIndex(where: { $0.id == id }) else { return }
                     self.uploads[index].progress = fraction

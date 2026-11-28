@@ -93,7 +93,16 @@ enum ProjectUploader {
         var begin: [String: Any] = ["instance_id": instanceID, "epoch": epoch, "file_name": file.fileName,
                                     "mime_type": file.mimeType, "size": file.data.count]
         if let threadID { begin["thread_id"] = threadID } else if let projectID { begin["project_id"] = projectID }
-        let started = try await client.rpc("project.upload.begin", params: begin)
+        let started: [String: Any]
+        do {
+            started = try await client.rpc("project.upload.begin", params: begin)
+        } catch let error as GatewayFailure where error.isThreadNotLoaded && threadID != nil && projectID != nil {
+            // A saved thread of a project closed in Zed is not loaded; the bridge accepts the
+            // project itself and writes into it on disk (wave 3 §6.3).
+            begin.removeValue(forKey: "thread_id")
+            begin["project_id"] = projectID
+            started = try await client.rpc("project.upload.begin", params: begin)
+        }
         guard let uploadID = started["upload_id"] as? String, !uploadID.isEmpty else { throw GatewayFailure.invalidResponse }
         let chunkSize: Int = max(16 * 1024, min(started["chunk_size"] as? Int ?? 786_432, 4 * 1024 * 1024))
         do {
