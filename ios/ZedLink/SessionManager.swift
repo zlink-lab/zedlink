@@ -2654,6 +2654,9 @@ import Network
                 delivery = outcome == "desktop_review_required" ? "Complete the feedback form in desktop Zed." : "Desktop action completed."
                 if pending.text == "/remote-control" { localExposureStopped = true; selectedThreadID = nil; try await loadThreads(); return }
             }
+            if outcome == "queued" {
+                showAutopilotNote("Агент занят: сообщение добавлено в очередь Zed.")
+            }
             try await loadSnapshot(pending.threadID)
         } catch {
             guard scope == operationScope, self.pending?.id == pending.id else { return }

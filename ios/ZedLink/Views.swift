@@ -593,6 +593,7 @@ private struct SessionRow: View {
     @State private var showingAgentHistory = false
     @State private var lastKnownTitle = ""
     @State private var showingModelControls = false
+    @State private var showingSendLater = false
     @State private var selectedElicitationID: String?
     @State private var showingConversationSearch = false
     @State private var showingAgentErrorDetails = false
@@ -832,6 +833,7 @@ private struct SessionRow: View {
             }
         }
         .sheet(isPresented: $showingModelControls) { SessionModelControls() }
+        .sheet(isPresented: $showingSendLater) { sendLaterSheet }
         .sheet(isPresented: Binding(get: { selectedElicitationID != nil }, set: { if !$0 { selectedElicitationID = nil } })) {
             NavigationStack {
                 ScrollView {
@@ -1355,10 +1357,15 @@ private struct SessionRow: View {
                 }
             }
             if !session.queuedMessages.isEmpty {
-                HStack {
-                    Text("\(session.queuedMessages.count) queued message\(session.queuedMessages.count == 1 ? "" : "s")")
-                    Spacer()
-                    Button("Clear queue", role: .destructive) { Task { await session.clearQueue() } }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("В очереди: \(session.queuedMessages.count)")
+                        Spacer()
+                        Button("Очистить", role: .destructive) { Task { await session.clearQueue() } }
+                    }
+                    ForEach(session.queuedMessages.prefix(3)) { entry in
+                        Text(entry.preview).font(.caption).foregroundStyle(ZLTheme.muted).lineLimit(1)
+                    }
                 }.font(.footnote)
             }
         }
@@ -1466,6 +1473,12 @@ private struct SessionRow: View {
                     .accessibilityIdentifier("composer-add")
                     VoiceDraftButton(text: $session.draft, scope: "\(session.profile?.id.uuidString ?? "").\(session.targetID ?? "").\(session.instanceID ?? "").\(session.epoch ?? "").\(session.selectedThreadID ?? "")")
                     Spacer(minLength: 0)
+                    if canScheduleDraft {
+                        Button { composerFocused = false; showingSendLater = true } label: {
+                            Image(systemName: "clock").font(.title3).frame(width: 44, height: 44)
+                        }
+                        .accessibilityLabel("Отправить позже").accessibilityIdentifier("send-later")
+                    }
                     sendOrStopButton
                 }.padding(.horizontal, 4)
             }
@@ -1583,6 +1596,38 @@ private struct SessionRow: View {
         }
     }
 
+    /// A scheduled message is plain text: the gateway sends it later through the autopilot.
+    private var canScheduleDraft: Bool {
+        guard session.state == .live, !session.demoPreview, let profile = session.profile,
+              session.targetID != nil, session.selectedThreadID == threadID,
+              extras.autopilotStatus(gatewayID: profile.gatewayID) != nil else { return false }
+        let text = session.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !text.isEmpty && !text.hasPrefix("/") && session.attachments.isEmpty
+            && session.contextPaths.isEmpty && session.uploads.isEmpty
+    }
+
+    @ViewBuilder private var sendLaterSheet: some View {
+        if let profile = session.profile, let targetID = session.targetID {
+            let scheduled: String = threadID
+            ContinueAtSheet(
+                threadTitle: session.threads.first { $0.id == scheduled }?.title ?? "Тред",
+                defaultText: "",
+                heading: "Отправить позже",
+                note: "Gateway отправит это сообщение в выбранное время. Если агент будет занят, оно встанет в очередь. Не дальше 7 дней.",
+                initialText: session.draft
+            ) { date, text in
+                guard let text else { return "Напишите текст сообщения." }
+                do {
+                    try await extras.schedule(profile: profile, targetID: targetID, threadID: scheduled, at: date, text: text)
+                    if session.selectedThreadID == scheduled { session.draft = "" }
+                    session.showAutopilotNote("Сообщение запланировано на \(ExtrasFormat.time(date)). Отменить можно в Сводке.")
+                    await extras.loadThreadNotes(profile: profile, targetID: targetID, threadID: scheduled)
+                    return nil
+                } catch { return AutopilotText.failure(error) }
+            }
+        }
+    }
+
     private var composerTextField: some View {
         TextField("Message Zed Agent…", text: $session.draft, axis: .vertical)
             .lineLimit(1...8).padding(.horizontal, 11).padding(.top, 6).padding(.bottom, 2)
@@ -1594,7 +1639,15 @@ private struct SessionRow: View {
     }
 
     private var sendOrStopButton: some View {
-        Group {
+        HStack(spacing: 0) {
+            // While a turn runs, a written message can still be sent: desktop Zed queues it.
+            if session.canCancel && hasSendableContent {
+                Button { sendAndDismissKeyboard() } label: {
+                    Image(systemName: "text.badge.plus").font(.headline).frame(width: 44, height: 44)
+                }.foregroundStyle(ZLTheme.background).background(ZLTheme.ink).clipShape(Circle())
+                    .disabled(!session.canSend)
+                    .accessibilityLabel("Добавить в очередь").accessibilityIdentifier("queue-prompt")
+            }
             if session.canCancel {
                 Button { composerFocused = false; Task { await session.cancelCurrentTurn() } } label: {
                     Image(systemName: "stop.fill")
