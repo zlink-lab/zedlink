@@ -81,12 +81,43 @@ private struct ZedSettingsRow: View {
                 Text(session.zedIssue).font(.caption).foregroundStyle(ZLTheme.danger)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let update = session.zedStatus?.update {
+                ZedUpdateRow(update: update)
+            }
             if session.canControlZed {
                 ZedControlButton()
             } else if session.zedStatus != nil {
                 Text("Запуск и перезапуск не настроены на gateway.").font(.caption).foregroundStyle(ZLTheme.muted)
             }
         }.padding(.vertical, 4)
+    }
+}
+
+/// Installed and staged patched Zed release; the update itself runs on the gateway.
+private struct ZedUpdateRow: View {
+    @EnvironmentObject private var session: SessionManager
+    let update: ZedUpdateStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let installed = update.installedTag {
+                Text("Версия: \(ZedUpdateStatus.short(installed))").font(.caption).foregroundStyle(ZLTheme.muted)
+            }
+            if let pending = update.pendingTag {
+                Text("Обновление \(ZedUpdateStatus.short(pending)): \(update.waitingText)")
+                    .font(.caption).foregroundStyle(ZLTheme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !update.applying {
+                    Button("Обновить без ожидания паузы") { Task { await session.updateZedNow() } }
+                        .font(.caption)
+                        .accessibilityHint("Установит обновление, как только все треды остановятся, без трёхминутной паузы.")
+                }
+            } else if let result = update.lastResultText {
+                Text(result).font(.caption).foregroundStyle(ZLTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityIdentifier("settings-zed-update")
     }
 }
 

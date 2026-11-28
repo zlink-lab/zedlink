@@ -11,6 +11,8 @@ struct ZedControlStatus: Equatable {
     var epoch: String?
     var generating: Int
     var restarting: Bool
+    /// Staged Zed release (gateway `zed_update`); nil on gateways without it.
+    var update: ZedUpdateStatus?
 
     init?(_ result: [String: Any]) {
         guard let bridge = result["bridge"] as? String else { return nil }
@@ -20,12 +22,63 @@ struct ZedControlStatus: Equatable {
         epoch = Self.text(result["epoch"])
         generating = result["generating"] as? Int ?? 0
         restarting = result["restarting"] as? Bool ?? false
+        update = (result["update"] as? [String: Any]).map(ZedUpdateStatus.init)
     }
 
     private static func text(_ value: Any?) -> String? {
         if let value = value as? String { return value }
         if let value = value as? NSNumber { return value.stringValue }
         return nil
+    }
+}
+
+/// `zed.status.update`: a release staged by `zed-zlink-update` waits until every thread stops.
+struct ZedUpdateStatus: Equatable {
+    var installedTag: String?
+    var pendingTag: String?
+    var waiting: String?
+    var applying: Bool
+    var lastResult: String?
+
+    init(_ value: [String: Any]) {
+        installedTag = value["installed_tag"] as? String
+        pendingTag = value["pending_tag"] as? String
+        waiting = value["waiting"] as? String
+        applying = value["applying"] as? Bool ?? false
+        lastResult = value["last_result"] as? String
+    }
+
+    /// `zed-v1.29.3-zlink.7` → `1.29.3 zlink.7`.
+    static func short(_ tag: String) -> String {
+        let trimmed = tag.hasPrefix("zed-v") ? String(tag.dropFirst(5)) : tag
+        return trimmed.replacingOccurrences(of: "-zlink.", with: " zlink.")
+    }
+
+    var waitingText: String {
+        if applying { return "устанавливается, Zed перезапускается…" }
+        switch waiting ?? "" {
+        case "turns_running": return "ждёт, пока агенты закончат"
+        case "waiting_approval": return "ждёт: тред ждёт подтверждения"
+        case "waiting_input": return "ждёт: тред ждёт ответа"
+        case "autopilot_job_due": return "ждёт: скоро задание автопилота"
+        case "settling": return "все треды стоят, установка через пару минут"
+        case "zed_hung": return "ждёт: Zed не отвечает"
+        case "bridge_busy": return "ждёт ответа Zed"
+        case "no_zed_control": return "управление Zed не настроено"
+        default: return "установится, когда все треды остановятся"
+        }
+    }
+
+    var lastResultText: String? {
+        guard let lastResult else { return nil }
+        let parts = lastResult.split(separator: " ", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return nil }
+        switch parts[0] {
+        case "installed": return "Установлено обновление \(Self.short(parts[1]))."
+        case "failed": return "Обновление \(Self.short(parts[1])) не запустилось, оставлена прежняя версия."
+        case "postponed": return "Обновление \(Self.short(parts[1])) отложено: Zed не закрылся."
+        default: return nil
+        }
     }
 }
 
@@ -96,6 +149,7 @@ enum ZedControlText {
             case "BUSY": return "Zed уже запускается или перезапускается."
             case "START_FAILED": return "Не удалось запустить Zed."
             case "UNSUPPORTED_CAPABILITY": return "Управление Zed не настроено на этом gateway."
+            case "NO_PENDING_UPDATE": return "Нет готового обновления Zed."
             default: break
             }
         }

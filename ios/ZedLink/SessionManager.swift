@@ -2929,6 +2929,19 @@ extension SessionManager {
         }
     }
 
+    /// `zed.update {"now": true}`: the gateway installs the staged release as soon as every
+    /// thread has stopped, skipping its settle time. It never interrupts a running turn.
+    func updateZedNow() async {
+        guard canControlZed, let client = await zedClient() else { return }
+        let scope = zedScope
+        do {
+            _ = try await client.rpc("zed.update", params: ["now": true])
+        } catch {
+            if scope == zedScope { updateZed { $0.issue = ZedControlText.failure(error) } }
+        }
+        _ = await refreshZedStatus()
+    }
+
     /// Opens the restart confirmation; its button calls `restartZed(force:)`.
     func requestZedRestart() {
         guard canControlZed, zed.operation == .idle else { return }
