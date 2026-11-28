@@ -42,6 +42,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod autopilot;
+mod db;
+mod limits;
+mod unread;
 mod zed_control;
 use web_push::{
     ContentEncoding, IsahcWebPushClient, SubscriptionInfo, Urgency, VapidSignatureBuilder,
@@ -60,6 +64,7 @@ const MAX_DEVICES: usize = 32;
 const MAX_WEBSOCKETS: usize = 64;
 const EVENT_POLL: Duration = Duration::from_secs(1);
 const NOTIFICATION_POLL: Duration = Duration::from_secs(2);
+const MONITOR_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(12);
 /// A turn that starts this long after the last phone `thread.send` was started on the desktop.
 const PHONE_SEND_WINDOW: Duration = Duration::from_secs(30);
@@ -90,6 +95,9 @@ struct Inner {
     failure_log: std::sync::Mutex<HashMap<String, Instant>>,
     /// Targets with a `zed.restart` in progress (no hung-Zed push meanwhile).
     zed_restarts: std::sync::Mutex<HashSet<String>>,
+    database: db::Database,
+    limit_samples: std::sync::Mutex<limits::SampleMemory>,
+    autopilot_runtime: std::sync::Mutex<autopilot::Runtime>,
 }
 struct ApnsProvider {
     team_id: String,
@@ -119,6 +127,13 @@ struct Persisted {
     /// Push notifications are sent only for these threads.
     #[serde(default)]
     remote_threads: BTreeSet<String>,
+    /// Last subscription-limit windows per agent (`limits.list`).
+    #[serde(default)]
+    limits: std::collections::BTreeMap<String, limits::StoredAgent>,
+    #[serde(default)]
+    unread: unread::UnreadState,
+    #[serde(default)]
+    autopilot: autopilot::AutopilotState,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ApnsDevice {
@@ -193,6 +208,9 @@ struct ThreadObservation {
     inputs: HashSet<String>,
     had_error: bool,
     last_sequence: u64,
+    /// Since when a Generating thread has had no new event (autopilot stall detection).
+    quiet_since: Option<Instant>,
+    stall_handled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +222,8 @@ enum NotificationEvent {
     Stopped(&'static str),
     /// The bridge accepts connections but stops answering (zed_control watchdog).
     ZedHung,
+    /// Something the autopilot did or needs (always pushed, whoever drove the thread).
+    Autopilot,
 }
 
 impl NotificationEvent {
@@ -215,6 +235,7 @@ impl NotificationEvent {
             Self::Error => "error",
             Self::Stopped(_) => "stopped",
             Self::ZedHung => "zed_hung",
+            Self::Autopilot => "autopilot",
         }
     }
 }
@@ -324,6 +345,7 @@ fn push_body(event: NotificationEvent, snapshot: &Value) -> String {
             .unwrap_or_else(|| "Ошибка".to_owned()),
         NotificationEvent::Stopped(reason) => format!("Остановлено: {reason}"),
         NotificationEvent::ZedHung => "Zed не отвечает".to_owned(),
+        NotificationEvent::Autopilot => "Автопилот".to_owned(),
     }
 }
 
@@ -349,19 +371,20 @@ fn push_heading(row: &Value, snapshot: &Value) -> (String, Option<String>) {
     (title, (!subtitle.is_empty()).then_some(subtitle))
 }
 
-fn apns_payload(message: &PushMessage, gateway_id: &str, created: u64) -> Value {
+/// `badge` is the device's unread total (`summary.unread`).
+fn apns_payload(message: &PushMessage, gateway_id: &str, created: u64, badge: u64) -> Value {
     let mut alert = json!({"title": message.title, "body": message.body});
     if let Some(subtitle) = &message.subtitle {
         alert["subtitle"] = json!(subtitle);
     }
     if message.event == NotificationEvent::ZedHung {
         return json!({"aps": {"alert": alert, "sound": "default", "category": "ZEDLINK_ZED",
-                "thread-id": format!("zed:{}", message.target_id)},
+                "thread-id": format!("zed:{}", message.target_id), "badge": badge},
             "type": "zed_hung", "event": message.event.kind(),
             "gateway": gateway_id, "target": message.target_id, "created": created});
     }
     json!({"aps": {"alert": alert, "sound": "default", "category": "ZEDLINK_REVIEW",
-            "thread-id": message.thread_id},
+            "thread-id": message.thread_id, "badge": badge},
         "type": "push", "event": message.event.kind(),
         "gateway": gateway_id, "target": message.target_id, "thread": message.thread_id,
         "instance": message.instance_id, "epoch": message.epoch, "created": created,
@@ -405,6 +428,65 @@ fn pending_approval_keys(snapshot: &Value) -> HashSet<String> {
 
 fn remote_thread_key(target_id: &str, thread_id: &str) -> String {
     format!("{target_id}:{thread_id}")
+}
+
+fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+/// A thread id as the bridge issues them (bounded, no control characters).
+fn valid_thread_id(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control))
+}
+
+/// Bridge `turn.stopped` events in `(after, through]` that carry token usage.
+fn turn_usages(events: &Value, after: u64, through: u64) -> Vec<(u64, db::TurnUsage)> {
+    events
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|event| event["kind"] == "turn.stopped")
+        .filter_map(|event| {
+            let sequence = event["sequence"].as_u64()?;
+            if sequence <= after || sequence > through {
+                return None;
+            }
+            Some((sequence, db::TurnUsage::from_event(&event["usage"])?))
+        })
+        .collect()
+}
+
+fn subagents_running(snapshot: &Value) -> bool {
+    snapshot["subagents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|child| {
+            !child["current_turn_id"].is_null()
+                || child["status"].as_str().is_some_and(|status| {
+                    let status = status.to_ascii_lowercase();
+                    status.contains("progress") || status.contains("pending")
+                })
+        })
+}
+
+/// Statistics key of a thread's agent: `claude`, `codex`, else its bounded id.
+fn usage_agent(thread: &Value) -> String {
+    let id = thread["agent"]["id"].as_str().unwrap_or("");
+    let name = thread["agent"]["name"].as_str().unwrap_or("");
+    match limits::agent_key(id, name) {
+        Some(agent) => agent.to_owned(),
+        None if !id.is_empty() => id
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(64)
+            .collect(),
+        None => "unknown".to_owned(),
+    }
 }
 
 /// Whether the bridge reported a user message typed in desktop Zed.
@@ -610,6 +692,10 @@ async fn run_gateway(
     tokio::spawn(async move { notifications.notification_monitor().await });
     let watchdog = state.clone();
     tokio::spawn(async move { watchdog.zed_watchdog().await });
+    let limits = state.clone();
+    tokio::spawn(async move { limits.limits_poller().await });
+    let autopilot = state.clone();
+    tokio::spawn(async move { autopilot.autopilot_runner().await });
 
     let mut servers = JoinSet::new();
     for (listener, tls) in servers_to_start {
@@ -937,6 +1023,7 @@ impl ApnsProvider {
         test_body: &str,
         gateway_id: &str,
         message: Option<&PushMessage>,
+        badge: u64,
     ) -> PushOutcome {
         if !valid_apns_token(&registration.token) {
             return PushOutcome::Failed;
@@ -953,7 +1040,7 @@ impl ApnsProvider {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let payload = match message {
-            Some(message) => apns_payload(message, gateway_id, created),
+            Some(message) => apns_payload(message, gateway_id, created, badge),
             None => json!({"aps": {"alert": {"title": "ZLink", "body": test_body},
                 "sound": "default", "category": "ZEDLINK_REVIEW"},
                 "gateway": gateway_id, "type": "push_test", "created": created}),
@@ -1081,6 +1168,9 @@ impl Gateway {
                 push_subscriptions: vec![],
                 apns_devices: vec![],
                 remote_threads: BTreeSet::new(),
+                limits: Default::default(),
+                unread: Default::default(),
+                autopilot: Default::default(),
             };
             save(&directory, &initial)?;
             initial
@@ -1092,6 +1182,7 @@ impl Gateway {
         VapidSignatureBuilder::from_base64_no_sub(&persisted.vapid_private_key)
             .context("invalid saved Web Push key")?;
         let (pairing_updates, _) = broadcast::channel(16);
+        let database = db::Database::open_in(&directory);
         Ok(Self(Arc::new(Inner {
             directory,
             targets,
@@ -1108,8 +1199,31 @@ impl Gateway {
             phone_sends: Mutex::new(HashMap::new()),
             failure_log: std::sync::Mutex::new(HashMap::new()),
             zed_restarts: std::sync::Mutex::new(HashSet::new()),
+            database,
+            limit_samples: std::sync::Mutex::new(HashMap::new()),
+            autopilot_runtime: std::sync::Mutex::new(autopilot::Runtime::default()),
         })))
     }
+    /// Applies `change` to a copy of the persisted state and saves it; the in-memory state
+    /// changes only when the save succeeded.
+    async fn mutate_persisted<R>(&self, change: impl FnOnce(&mut Persisted) -> R) -> R {
+        self.change_persisted(|state| (true, change(state))).await
+    }
+
+    /// Like `mutate_persisted`, but saves only when `change` reports a change.
+    async fn change_persisted<R>(&self, change: impl FnOnce(&mut Persisted) -> (bool, R)) -> R {
+        let mut persisted = self.0.persisted.lock().await;
+        let mut next = persisted.clone();
+        let (changed, result) = change(&mut next);
+        if changed {
+            match save(&self.0.directory, &next) {
+                Ok(()) => *persisted = next,
+                Err(error) => eprintln!("state save failed: {error:#}"),
+            }
+        }
+        result
+    }
+
     async fn authorize(&self, headers: &HeaderMap) -> Option<Uuid> {
         let token = headers
             .get("authorization")?
@@ -1370,6 +1484,7 @@ impl Gateway {
                     .retain(|subscription| subscription.device_id != id);
                 next.apns_devices
                     .retain(|registration| registration.device_id != id);
+                next.unread.forget_device(id);
                 if next.devices.len() != before {
                     save(&self.0.directory, &next)?;
                     *persisted = next;
@@ -1504,7 +1619,16 @@ impl Gateway {
     async fn notify_all(&self, message: &PushMessage) {
         let persisted = self.0.persisted.lock().await;
         let subscriptions = persisted.push_subscriptions.clone();
-        let apns_devices = persisted.apns_devices.clone();
+        let apns_devices = persisted
+            .apns_devices
+            .iter()
+            .map(|registration| {
+                (
+                    registration.clone(),
+                    persisted.unread.total(registration.device_id),
+                )
+            })
+            .collect::<Vec<_>>();
         let gateway_id = persisted.gateway_id.to_string();
         drop(persisted);
         let mut stale = HashSet::new();
@@ -1527,10 +1651,16 @@ impl Gateway {
         }
         if let Some(provider) = &self.0.apns {
             let mut expired = HashSet::new();
-            for registration in apns_devices {
+            for (registration, badge) in apns_devices {
                 if matches!(
                     provider
-                        .send(&registration, &message.body, &gateway_id, Some(message))
+                        .send(
+                            &registration,
+                            &message.body,
+                            &gateway_id,
+                            Some(message),
+                            badge
+                        )
                         .await,
                     PushOutcome::Stale
                 ) {
@@ -1549,30 +1679,42 @@ impl Gateway {
         }
     }
 
+    /// Polls every exposed thread. Runs whether or not anyone subscribed to pushes: unread
+    /// counters, per-turn usage and the autopilot depend on it; only pushes need subscribers.
     async fn notification_monitor(&self) {
         let mut prior = HashMap::<String, ThreadObservation>::new();
+        // Targets whose bridge failed: polled again only after a growing pause, so a hung
+        // Zed's socket backlog is not filled by this loop (the watchdog must still see it).
+        let mut backoff = HashMap::<String, (Instant, Duration)>::new();
         let mut interval = tokio::time::interval(NOTIFICATION_POLL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let persisted = self.0.persisted.lock().await;
-            let no_subscribers = persisted.push_subscriptions.is_empty()
-                && (self.0.apns.is_none() || persisted.apns_devices.is_empty());
-            drop(persisted);
-            if no_subscribers {
-                prior.clear();
-                continue;
-            }
             let mut current = prior.clone();
             for target in &self.0.targets {
+                if backoff
+                    .get(&target.id)
+                    .is_some_and(|(retry_at, _)| Instant::now() < *retry_at)
+                {
+                    continue;
+                }
                 let request = json!({
                     "version": 1,
                     "request_id": Uuid::new_v4().to_string(),
                     "method": "thread.list",
                     "params": {},
                 });
-                let Ok(response) = self.probe(Some(&target.id), &request).await else {
+                // A closed Zed is normal; `probe_native` keeps it out of the failure log.
+                let Ok(response) = self.probe_native(Some(&target.id), &request).await else {
+                    let pause = backoff
+                        .get(&target.id)
+                        .map_or(NOTIFICATION_POLL * 2, |(_, pause)| {
+                            (*pause * 2).min(MONITOR_MAX_BACKOFF)
+                        });
+                    backoff.insert(target.id.clone(), (Instant::now() + pause, pause));
                     continue;
                 };
+                backoff.remove(&target.id);
                 let Some(threads) = response["result"]["threads"].as_array() else {
                     continue;
                 };
@@ -1587,122 +1729,242 @@ impl Gateway {
                     let Some(thread_id) = thread["thread_id"].as_str() else {
                         continue;
                     };
-                    let snapshot_request = json!({
-                        "version": 1,
-                        "request_id": Uuid::new_v4().to_string(),
-                        "method": "thread.snapshot",
-                        // A short tail keeps the poll cheap and still holds the last reply.
-                        "params": {"thread_id": thread_id, "tail_entry_count": 8},
-                    });
                     let key = format!("{}:{instance}:{epoch}:{thread_id}", target.id);
-                    let snapshot_result;
-                    let (approvals, last_sequence, status, had_error) =
-                        match self.probe(Some(&target.id), &snapshot_request).await {
-                            Ok(snapshot) => {
-                                let Some(result) = snapshot.get("result").filter(|result| {
-                                    result["pending_approvals"].is_array()
-                                        && result["instance_id"].as_str() == Some(instance)
-                                        && result["epoch"].as_str() == Some(epoch)
-                                }) else {
-                                    if let Some(previous) = prior.get(&key) {
-                                        current.insert(key, previous.clone());
-                                    }
-                                    continue;
-                                };
-                                snapshot_result = result.clone();
-                                (
-                                    pending_approval_keys(result),
-                                    result["last_sequence"].as_u64().unwrap_or(0),
-                                    result["status"].as_str().unwrap_or("Unknown").to_owned(),
-                                    result["had_error"].as_bool().unwrap_or(false),
-                                )
-                            }
-                            Err(_) => {
-                                if let Some(previous) = prior.get(&key) {
-                                    current.insert(key, previous.clone());
-                                }
-                                continue;
-                            }
-                        };
-                    let inputs = self.probe(Some(&target.id), &json!({
-                            "version": 1,
-                            "request_id": Uuid::new_v4().to_string(),
-                            "method": "thread.elicitations",
-                            "params": {"thread_id": thread_id, "instance_id": instance, "epoch": epoch},
-                        })).await.ok()
-                        .and_then(|response| response["result"]["elicitations"].as_array().map(|rows| rows.iter()
-                                .take(128)
-                                .filter(|row| row["status"] == "pending")
-                                .filter_map(|row| row["elicitation_id"].as_str().map(str::to_owned))
-                                .collect::<HashSet<_>>()))
-                        .unwrap_or_else(|| prior.get(&key).map(|previous| previous.inputs.clone()).unwrap_or_default());
-                    let observation = ThreadObservation {
-                        status,
-                        approvals,
-                        inputs,
-                        had_error,
-                        last_sequence,
-                    };
-                    let mut stop_reason = None;
-                    if let Some(previous) = prior.get(&key) {
-                        let events_request = json!({
-                            "version": 1,
-                            "request_id": Uuid::new_v4().to_string(),
-                            "method": "thread.events",
-                            "params": {"thread_id": thread_id, "after_sequence": previous.last_sequence},
-                        });
-                        let events = self
-                            .probe(Some(&target.id), &events_request)
-                            .await
-                            .ok()
-                            .filter(|events| {
-                                events["result"]["instance_id"].as_str() == Some(instance)
-                                    && events["result"]["epoch"].as_str() == Some(epoch)
-                            });
-                        let events = events.as_ref().map(|events| &events["result"]["events"]);
-                        stop_reason = events
-                            .and_then(|events| latest_stop_reason(events, last_sequence))
-                            .map(str::to_owned);
-                        // A message typed in desktop Zed hands the thread back to the desktop.
-                        // Bridges without message origins fall back to: a turn that started
-                        // without a recent phone send was started on the desktop.
-                        let desktop_turn_started = previous.status != "Generating"
-                            && observation.status == "Generating"
-                            && !self.phone_sent_recently(&target.id, thread_id).await;
-                        if desktop_turn_started
-                            || events
-                                .is_some_and(|events| has_local_user_message(events, last_sequence))
-                        {
-                            self.set_remote_thread(&target.id, thread_id, false).await;
-                        }
-                    }
-                    let initial = ThreadObservation::default();
-                    if let Some(event) = thread_notification(
-                        prior.get(&key).unwrap_or(&initial),
-                        &observation,
-                        stop_reason.as_deref(),
-                    ) && self.is_remote_thread(&target.id, thread_id).await
+                    if let Some(observation) = self
+                        .observe_thread(target, instance, epoch, thread, thread_id, prior.get(&key))
+                        .await
                     {
-                        let (title, subtitle) = push_heading(thread, &snapshot_result);
-                        let message = PushMessage {
-                            title,
-                            subtitle,
-                            body: push_body(event, &snapshot_result),
-                            event,
-                            target_id: target.id.clone(),
-                            thread_id: thread_id.to_owned(),
-                            instance_id: instance.to_owned(),
-                            epoch: epoch.to_owned(),
-                            project_id: nonempty(&thread["project_id"]).map(str::to_owned),
-                            host_id: nonempty(&thread["host_id"]).map(str::to_owned),
-                        };
-                        self.notify_all(&message).await;
+                        current.insert(key, observation);
+                    } else if let Some(previous) = prior.get(&key) {
+                        current.insert(key, previous.clone());
                     }
-                    current.insert(key, observation);
                 }
             }
             prior = current;
         }
+    }
+
+    /// One thread of one monitor pass; `None` when its snapshot was unavailable.
+    async fn observe_thread(
+        &self,
+        target: &ProbeTarget,
+        instance: &str,
+        epoch: &str,
+        thread: &Value,
+        thread_id: &str,
+        previous: Option<&ThreadObservation>,
+    ) -> Option<ThreadObservation> {
+        let snapshot_request = json!({
+            "version": 1,
+            "request_id": Uuid::new_v4().to_string(),
+            "method": "thread.snapshot",
+            // A short tail keeps the poll cheap and still holds the last reply.
+            "params": {"thread_id": thread_id, "tail_entry_count": 8},
+        });
+        let snapshot = self.probe(Some(&target.id), &snapshot_request).await.ok()?;
+        let snapshot = snapshot.get("result").filter(|result| {
+            result["pending_approvals"].is_array()
+                && result["instance_id"].as_str() == Some(instance)
+                && result["epoch"].as_str() == Some(epoch)
+        })?;
+        let last_sequence = snapshot["last_sequence"].as_u64().unwrap_or(0);
+        let inputs = self
+            .probe(
+                Some(&target.id),
+                &json!({
+                    "version": 1,
+                    "request_id": Uuid::new_v4().to_string(),
+                    "method": "thread.elicitations",
+                    "params": {"thread_id": thread_id, "instance_id": instance, "epoch": epoch},
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|response| {
+                response["result"]["elicitations"].as_array().map(|rows| {
+                    rows.iter()
+                        .take(128)
+                        .filter(|row| row["status"] == "pending")
+                        .filter_map(|row| row["elicitation_id"].as_str().map(str::to_owned))
+                        .collect::<HashSet<_>>()
+                })
+            })
+            .unwrap_or_else(|| {
+                previous
+                    .map(|previous| previous.inputs.clone())
+                    .unwrap_or_default()
+            });
+        let mut observation = ThreadObservation {
+            status: snapshot["status"].as_str().unwrap_or("Unknown").to_owned(),
+            approvals: pending_approval_keys(snapshot),
+            inputs,
+            had_error: snapshot["had_error"].as_bool().unwrap_or(false),
+            last_sequence,
+            quiet_since: None,
+            stall_handled: false,
+        };
+        let mut stop_reason = None;
+        if let Some(previous) = previous {
+            let events_request = json!({
+                "version": 1,
+                "request_id": Uuid::new_v4().to_string(),
+                "method": "thread.events",
+                "params": {"thread_id": thread_id, "after_sequence": previous.last_sequence},
+            });
+            let events = self
+                .probe(Some(&target.id), &events_request)
+                .await
+                .ok()
+                .filter(|events| {
+                    events["result"]["instance_id"].as_str() == Some(instance)
+                        && events["result"]["epoch"].as_str() == Some(epoch)
+                });
+            let events = events.as_ref().map(|events| &events["result"]["events"]);
+            stop_reason = events
+                .and_then(|events| latest_stop_reason(events, last_sequence))
+                .map(str::to_owned);
+            if let Some(events) = events {
+                self.record_turn_usage(
+                    &target.id,
+                    thread_id,
+                    epoch,
+                    thread,
+                    turn_usages(events, previous.last_sequence, last_sequence),
+                )
+                .await;
+            }
+            // A message typed in desktop Zed hands the thread back to the desktop.
+            // Bridges without message origins fall back to: a turn that started
+            // without a recent phone send was started on the desktop.
+            let typed_on_desktop =
+                events.is_some_and(|events| has_local_user_message(events, last_sequence));
+            let desktop_turn_started = previous.status != "Generating"
+                && observation.status == "Generating"
+                && !self.phone_sent_recently(&target.id, thread_id).await;
+            if desktop_turn_started || typed_on_desktop {
+                self.set_remote_thread(&target.id, thread_id, false).await;
+            }
+            if typed_on_desktop {
+                self.mark_thread_read_everywhere(&target.id, thread_id)
+                    .await;
+                self.autopilot_exempt_turns(&target.id, thread_id);
+            }
+        }
+        let initial = ThreadObservation::default();
+        let event = thread_notification(
+            previous.unwrap_or(&initial),
+            &observation,
+            stop_reason.as_deref(),
+        );
+        if let Some(event) = event {
+            // The first sight of a thread (gateway start, new Zed epoch) replays old state;
+            // only changes count as new agent events.
+            if previous.is_some() {
+                self.record_thread_event(&target.id, thread_id).await;
+            }
+            if self.is_remote_thread(&target.id, thread_id).await {
+                let (title, subtitle) = push_heading(thread, snapshot);
+                let message = PushMessage {
+                    title,
+                    subtitle,
+                    body: push_body(event, snapshot),
+                    event,
+                    target_id: target.id.clone(),
+                    thread_id: thread_id.to_owned(),
+                    instance_id: instance.to_owned(),
+                    epoch: epoch.to_owned(),
+                    project_id: nonempty(&thread["project_id"]).map(str::to_owned),
+                    host_id: nonempty(&thread["host_id"]).map(str::to_owned),
+                };
+                self.notify_all(&message).await;
+            }
+            if previous.is_some() {
+                self.autopilot_observe(
+                    &target.id,
+                    thread_id,
+                    event,
+                    stop_reason.as_deref(),
+                    snapshot,
+                )
+                .await;
+            }
+        }
+        if observation.status == "Generating" {
+            // Waiting for the user or for a running subagent is not a stall.
+            let waiting = !observation.approvals.is_empty()
+                || !observation.inputs.is_empty()
+                || subagents_running(snapshot);
+            let unchanged = previous.filter(|previous| {
+                !waiting
+                    && previous.status == "Generating"
+                    && previous.last_sequence == last_sequence
+            });
+            observation.quiet_since = Some(
+                unchanged
+                    .and_then(|previous| previous.quiet_since)
+                    .unwrap_or_else(Instant::now),
+            );
+            observation.stall_handled = unchanged.is_some_and(|previous| previous.stall_handled);
+            let stall_after = Duration::from_secs(
+                u64::from(
+                    self.0
+                        .persisted
+                        .lock()
+                        .await
+                        .autopilot
+                        .settings
+                        .stall_minutes,
+                ) * 60,
+            );
+            if !observation.stall_handled
+                && observation
+                    .quiet_since
+                    .is_some_and(|since| since.elapsed() >= stall_after)
+            {
+                observation.stall_handled = true;
+                self.autopilot_stalled(&target.id, thread_id, snapshot)
+                    .await;
+            } else {
+                self.autopilot_budget_stop(&target.id, thread_id, snapshot)
+                    .await;
+            }
+        }
+        Some(observation)
+    }
+
+    /// Stores each finished turn's token usage once (key: epoch and event sequence).
+    async fn record_turn_usage(
+        &self,
+        target_id: &str,
+        thread_id: &str,
+        epoch: &str,
+        thread: &Value,
+        usages: Vec<(u64, db::TurnUsage)>,
+    ) {
+        if usages.is_empty() {
+            return;
+        }
+        let (target_id, thread_id) = (target_id.to_owned(), thread_id.to_owned());
+        let epoch = epoch.to_owned();
+        let agent = usage_agent(thread);
+        let at = now_seconds();
+        self.0
+            .database
+            .run(move |connection| {
+                for (sequence, usage) in &usages {
+                    db::insert_turn(
+                        connection,
+                        &target_id,
+                        &thread_id,
+                        &format!("{epoch}:{sequence}"),
+                        &agent,
+                        at,
+                        usage,
+                    )?;
+                }
+                Ok(())
+            })
+            .await;
     }
 }
 
@@ -1790,6 +2052,7 @@ async fn pair(State(state): State<Gateway>, Json(request): Json<PairRequest>) ->
         name: request.device_name,
         digest: hex::encode(digest(&token)),
     });
+    next.unread.start_device(id);
     if save(&state.0.directory, &next).is_err() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2237,6 +2500,7 @@ async fn apns_test(State(state): State<Gateway>, headers: HeaderMap) -> impl Int
             "Native push is ready for this device.",
             &gateway_id,
             None,
+            0,
         )
         .await
     {
@@ -2320,7 +2584,27 @@ fn allowed_rpc_method(method: &str) -> bool {
             | "thread.open"
             | "host.directory"
             | "host.add"
+            | "limits.list"
+            | "summary.unread"
+            | "summary.mark_read"
+            | "autopilot.status"
+            | "autopilot.schedule"
+            | "autopilot.cancel"
+            | "autopilot.thread"
+            | "autopilot.settings"
+            | "autopilot.history"
+            | "stats.thread"
+            | "stats.usage"
+            | "stats.limits"
     )
+}
+
+/// Methods the gateway answers itself (no bridge call is forwarded).
+fn gateway_local_method(method: &str) -> bool {
+    method == "limits.list"
+        || method.starts_with("summary.")
+        || method.starts_with("autopilot.")
+        || method.starts_with("stats.")
 }
 
 /// Bounds for the workspace/host methods. The native side validates again; the
@@ -2426,10 +2710,16 @@ async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> i
             Json(json!({"version":1,"request_id":original_request_id,"result":result})),
         );
     }
-    if method.starts_with("zed.") {
-        let (status, body) = state
-            .zed_rpc(&method, target_id.as_deref(), &request["params"])
-            .await;
+    if method.starts_with("zed.") || gateway_local_method(&method) {
+        let params = &request["params"];
+        let target = target_id.as_deref();
+        let (status, body) = match method.split('.').next() {
+            Some("zed") => state.zed_rpc(&method, target, params).await,
+            Some("summary") => state.summary_rpc(&method, device_id, target, params).await,
+            Some("autopilot") => state.autopilot_rpc(&method, target, params).await,
+            Some("stats") => state.stats_rpc(&method, target, params).await,
+            _ => (StatusCode::OK, Ok(state.limits_list().await)),
+        };
         let body = match body {
             Ok(result) => json!({"version":1,"request_id":original_request_id,"result":result}),
             Err(error) => json!({"version":1,"request_id":original_request_id,"error":error}),
@@ -2598,6 +2888,32 @@ async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> i
             Json(json!({"version":1,"request_id":original_request_id,"result":result})),
         );
     }
+    if method == "thread.send"
+        && let Some(command) = request["params"]["text"]
+            .as_str()
+            .and_then(autopilot::parse_auto)
+    {
+        let (Ok(target), Some(thread_id)) = (
+            state.target(target_id.as_deref()),
+            valid_thread_id(&request["params"]["thread_id"]),
+        ) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"INVALID_REQUEST"})),
+            );
+        };
+        let target_id = target.id.clone();
+        let body = match state
+            .autopilot_command(&target_id, thread_id, command)
+            .await
+        {
+            Ok(message) => json!({"version":1,"request_id":original_request_id,
+                "result":{"intercepted":"autopilot","message":message}}),
+            Err(code) => json!({"version":1,"request_id":original_request_id,
+                "error":{"code":code}}),
+        };
+        return (StatusCode::OK, Json(body));
+    }
     if matches!(
         method.as_str(),
         "thread.send"
@@ -2637,6 +2953,7 @@ async fn rpc(State(state): State<Gateway>, headers: HeaderMap, body: Bytes) -> i
                 )
             {
                 state.set_remote_thread(&target.id, thread_id, true).await;
+                state.autopilot_exempt_turns(&target.id, thread_id);
             }
             response["request_id"] = json!(original_request_id);
             (StatusCode::OK, Json(response))
@@ -2961,6 +3278,7 @@ mod tests {
             inputs: HashSet::new(),
             had_error: false,
             last_sequence: 1,
+            ..Default::default()
         };
         let failed = ThreadObservation {
             status: "Idle".into(),
@@ -2968,6 +3286,7 @@ mod tests {
             inputs: HashSet::new(),
             had_error: true,
             last_sequence: 2,
+            ..Default::default()
         };
         assert_eq!(
             thread_notification(&generating, &failed, Some("error")),
@@ -3096,6 +3415,34 @@ mod tests {
     }
 
     #[test]
+    fn turn_usage_is_read_from_stopped_events_in_range() {
+        let events = json!([
+            {"sequence": 3, "kind": "turn.stopped", "usage": {"input_tokens": 9}},
+            {"sequence": 4, "kind": "entry.updated"},
+            {"sequence": 5, "kind": "turn.stopped", "stop_reason": "completed",
+             "usage": {"input_tokens": 10, "output_tokens": 2, "cache_read_tokens": 100,
+                       "cache_write_tokens": 5, "thought_tokens": 1}},
+            // Old bridges send no usage.
+            {"sequence": 6, "kind": "turn.stopped", "stop_reason": "completed"},
+            {"sequence": 8, "kind": "turn.stopped", "usage": {"input_tokens": 1}},
+        ]);
+        let usages = turn_usages(&events, 3, 7);
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].0, 5);
+        assert_eq!(usages[0].1.cache_read, 100);
+        assert_eq!(usages[0].1.thought, 1);
+        assert_eq!(
+            usage_agent(&json!({"agent": {"id": "claude-acp", "name": "Claude Agent"}})),
+            "claude"
+        );
+        assert_eq!(
+            usage_agent(&json!({"agent": {"id": "zed", "name": "Zed Agent"}})),
+            "zed"
+        );
+        assert_eq!(usage_agent(&json!({})), "unknown");
+    }
+
+    #[test]
     fn listeners_may_bind_private_and_mesh_addresses_only() {
         for address in [
             "127.0.0.1",
@@ -3115,6 +3462,56 @@ mod tests {
     }
 
     #[test]
+    fn running_subagents_are_not_a_stall() {
+        assert!(!subagents_running(&json!({"subagents": []})));
+        assert!(subagents_running(
+            &json!({"subagents": [{"current_turn_id": 3}]})
+        ));
+        assert!(subagents_running(
+            &json!({"subagents": [{"current_turn_id": null, "status": "InProgress"}]})
+        ));
+        assert!(!subagents_running(
+            &json!({"subagents": [{"current_turn_id": null, "status": "Completed"}]})
+        ));
+    }
+
+    #[test]
+    fn gateway_local_methods_are_allowed_and_not_forwarded() {
+        for method in [
+            "limits.list",
+            "summary.unread",
+            "summary.mark_read",
+            "autopilot.status",
+            "autopilot.schedule",
+            "autopilot.cancel",
+            "autopilot.thread",
+            "autopilot.settings",
+            "autopilot.history",
+            "stats.thread",
+            "stats.usage",
+            "stats.limits",
+        ] {
+            assert!(allowed_rpc_method(method), "{method}");
+            assert!(gateway_local_method(method), "{method}");
+        }
+        assert!(!allowed_rpc_method("autopilot.run"));
+        assert!(!gateway_local_method("thread.send"));
+        assert!(!gateway_local_method("agent.limits"));
+    }
+
+    #[test]
+    fn state_from_wave_two_loads_with_wave_three_defaults() {
+        let state: Persisted = serde_json::from_value(json!({
+            "gateway_id": Uuid::new_v4(), "devices": [], "remote_threads": ["d:t"],
+        }))
+        .unwrap();
+        assert!(state.limits.is_empty());
+        assert!(state.unread.events.is_empty());
+        assert!(state.autopilot.settings.enabled);
+        assert!(state.autopilot.auto_continue("d", "t"));
+    }
+
+    #[test]
     fn apns_payload_carries_routing_for_tap() {
         let message = PushMessage {
             title: "T".into(),
@@ -3128,8 +3525,9 @@ mod tests {
             project_id: Some("p1".into()),
             host_id: None,
         };
-        let payload = apns_payload(&message, "g1", 7);
+        let payload = apns_payload(&message, "g1", 7, 3);
         assert_eq!(payload["type"], "push");
+        assert_eq!(payload["aps"]["badge"], 3);
         assert_eq!(payload["instance"], "i1");
         assert_eq!(payload["epoch"], "e1");
         assert_eq!(payload["project_id"], "p1");

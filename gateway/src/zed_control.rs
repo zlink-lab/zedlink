@@ -35,7 +35,7 @@ impl BridgeState {
 }
 
 pub(super) struct BridgeCheck {
-    state: BridgeState,
+    pub(super) state: BridgeState,
     pid: Option<i32>,
     info: Option<Value>,
 }
@@ -502,8 +502,9 @@ mod tests {
             project_id: None,
             host_id: None,
         };
-        let payload = apns_payload(&message, "g1", 1);
+        let payload = apns_payload(&message, "g1", 1, 2);
         assert_eq!(payload["type"], "zed_hung");
+        assert_eq!(payload["aps"]["badge"], 2);
         assert_eq!(payload["aps"]["category"], "ZEDLINK_ZED");
         assert_eq!(payload["target"], "desktop");
         assert!(payload.get("thread").is_none());
