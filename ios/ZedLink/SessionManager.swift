@@ -153,6 +153,9 @@ import Network
     @Published var summaryThreadID: String?
     /// The tab the user is on; a thread created from a conversation opens on that tab's stack.
     var visibleStack: ThreadDestination = .sessions
+    /// The selected thread's project is not open in Zed (`PROJECT_NOT_OPEN`, closed SSH project):
+    /// the file browser offers "Открыть в Zed".
+    @Published private(set) var projectNotOpen = false
     @Published private(set) var delivery = ""
     @Published private(set) var issue = ""
     @Published private(set) var controlsIssue = ""
@@ -306,7 +309,7 @@ import Network
         threadSettings = nil
         ApprovalNotifications.shared.clear()
         previewRequest = UUID(); previewReadable = false; previewLoading = false; previewTruncated = false; projectFilesTruncated = false
-        projectFolderEntries = nil; directoryRequest = UUID()
+        projectFolderEntries = nil; directoryRequest = UUID(); projectNotOpen = false
         projectFiles = []; changes = []; changesRevision = nil; terminals = []; terminalSnapshot = nil; configuredTasks = []; debuggerCatalog = []; debuggerSessions = []; previewTitle = ""; previewContent = ""; contextPaths = []
         creatingThread = false
         pending = nil
@@ -1118,7 +1121,7 @@ import Network
             diffContent = ""; diffLoading = false; diffRequest = UUID()
             previewRequest = UUID(); previewReadable = false; previewLoading = false; previewContent = ""; previewTitle = ""
             projectFolderEntries = nil; directoryRequest = UUID()
-            projectFiles = []; projectFilesTruncated = false
+            projectFiles = []; projectFilesTruncated = false; projectNotOpen = false
             snapshot = nil
             lastSnapshotAt = nil
             controlsIssue = ""
@@ -1722,12 +1725,20 @@ import Network
             let base: [String: Any] = ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": threadID]
             if page == nil || page == .files {
                 if capabilities.contains("project.files") {
-                    let result = try await client.rpc("project.files", params: base)
-                    guard current() else { return }
-                    projectFilesTruncated = result["truncated"] as? Bool ?? false
-                    projectFiles = (result["entries"] as? [[String: Any]] ?? []).compactMap { row in
-                        guard let path = row["path"] as? String else { return nil }
-                        return NativeProjectFile(id: path, kind: row["kind"] as? String ?? "file", size: row["size"] as? Int)
+                    do {
+                        let result = try await client.rpc("project.files", params: base)
+                        guard current() else { return }
+                        projectNotOpen = false
+                        projectFilesTruncated = result["truncated"] as? Bool ?? false
+                        projectFiles = (result["entries"] as? [[String: Any]] ?? []).compactMap { row in
+                            guard let path = row["path"] as? String else { return nil }
+                            return NativeProjectFile(id: path, kind: row["kind"] as? String ?? "file", size: row["size"] as? Int)
+                        }
+                    } catch let error as GatewayFailure where error.isProjectNotOpen {
+                        guard current() else { return }
+                        projectNotOpen = true
+                        projectFiles = []
+                        projectFilesTruncated = false
                     }
                 }
             }
@@ -2147,7 +2158,12 @@ import Network
                 return NativeProjectFile(id: path, kind: row["kind"] as? String ?? "file", size: row["size"] as? Int)
             }
             projectFolderTruncated = result["truncated"] as? Bool ?? false
-        } catch { if request == directoryRequest { issue = error.localizedDescription } }
+            projectNotOpen = false
+        } catch {
+            guard request == directoryRequest else { return }
+            if (error as? GatewayFailure)?.isProjectNotOpen == true { projectNotOpen = true }
+            else { issue = error.localizedDescription }
+        }
     }
 
     func previewFile(_ path: String) async {
@@ -2168,6 +2184,11 @@ import Network
             guard request == previewRequest, scope.0 == profile?.id, scope.1 == targetID,
                   scope.2 == instanceID, scope.3 == epoch, scope.4 == selectedThreadID else { return }
             previewLoading = false; previewContent = "File unavailable: " + error.localizedDescription
+            if (error as? GatewayFailure)?.isProjectNotOpen == true { projectNotOpen = true }
+            else if case GatewayFailure.native("UNSUPPORTED_CAPABILITY") = error {
+                // The bridge lists files of open remote (SSH) projects but cannot read them yet.
+                previewContent = "Файлы этого удалённого проекта Zed пока не отдаёт на телефон (UNSUPPORTED_CAPABILITY)."
+            }
         }
     }
 
@@ -2718,7 +2739,7 @@ import Network
     }
 }
 
-// MARK: Wave 3: autopilot notes and the active gateway address
+// MARK: Wave 3: autopilot notes, the active gateway address, closed projects
 
 /// Which tab's navigation stack a programmatically opened thread is pushed on (§6.7).
 enum ThreadDestination {
@@ -2727,6 +2748,29 @@ enum ThreadDestination {
 }
 
 extension SessionManager {
+    /// "Открыть в Zed" after `PROJECT_NOT_OPEN`: opens the selected thread's workspace the way
+    /// Zed's sidebar does (`workspace.open`), then reloads the file listing.
+    @discardableResult
+    func openSelectedThreadProject() async -> Bool {
+        guard let threadID = selectedThreadID, let thread = threads.first(where: { $0.id == threadID }) else { return false }
+        if supportsWorkspaces && workspaceHosts.isEmpty { await loadWorkspaces() }
+        guard let location = workspaceLocation(for: thread) else {
+            issue = "Не удалось определить проект этого треда. Откройте его в Zed на компьютере."
+            return false
+        }
+        guard capabilities.contains("workspace.open") else {
+            issue = "Откройте \(location.project.name) в Zed на компьютере."
+            return false
+        }
+        guard await openWorkspace(host: location.host, paths: location.project.paths, name: location.project.name) else {
+            if workspaceIssue.isEmpty { issue = "Zed не смог открыть \(location.project.name)." }
+            return false
+        }
+        projectNotOpen = false
+        await loadProjectContext(page: .files)
+        return true
+    }
+
     func showAutopilotNote(_ message: String) {
         autopilotNote = message
         autopilotNoteTask?.cancel()

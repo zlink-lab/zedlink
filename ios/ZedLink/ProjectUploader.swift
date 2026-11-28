@@ -139,6 +139,7 @@ enum ProjectUploader {
             case "UNKNOWN_UPLOAD": return "The upload expired on the desktop (UNKNOWN_UPLOAD). Attach the file again."
             case "UPLOAD_FAILED": return "Zed could not write the file into the project (UPLOAD_FAILED)."
             case "INVALID_REQUEST": return "Zed rejected the upload (INVALID_REQUEST)."
+            case "PROJECT_NOT_OPEN": return "Проект не открыт в Zed (PROJECT_NOT_OPEN). Откройте его в Zed и повторите."
             default: break
             }
         }

@@ -12,6 +12,7 @@ struct ProjectFileBrowser: View {
     @State private var searchStatus = ""
     @State private var searchTask: Task<Void, Never>?
     @State private var selectedLine: Int?
+    @State private var openingProject = false
 
     private var entries: [NativeProjectFile] {
         let prefix = directory.isEmpty ? "" : directory + "/"
@@ -47,6 +48,7 @@ struct ProjectFileBrowser: View {
                 .navigationTitle(session.previewTitle.split(separator: "/").last.map(String.init) ?? "File")
             } else {
                 List {
+                    if session.projectNotOpen { projectNotOpenSection }
                     if session.capabilities.contains("project.search") {
                         Section("Search contents") {
                             HStack {
@@ -110,6 +112,34 @@ struct ProjectFileBrowser: View {
             .task(id: directory) { await session.loadDirectory(directory) }
             .onDisappear { searchTask?.cancel() }
             .onChange(of: session.operationScope) { _, _ in searchTask?.cancel(); matches = []; searchStatus = ""; reading = false }
+    }
+
+    /// `PROJECT_NOT_OPEN`: a closed SSH project cannot be read from disk by the bridge.
+    private var projectNotOpenSection: some View {
+        Section {
+            Label("Проект не открыт в Zed. Файлы закрытого SSH-проекта доступны после того, как Zed его откроет.",
+                  systemImage: "folder.badge.questionmark")
+                .font(.footnote).foregroundStyle(ZLTheme.warning)
+            Button {
+                openingProject = true
+                Task {
+                    defer { openingProject = false }
+                    if await session.openSelectedThreadProject() { await session.loadDirectory(directory) }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    if openingProject || session.workspaceProgress != nil { ProgressView().controlSize(.small) }
+                    Text("Открыть в Zed")
+                }
+            }
+            .disabled(openingProject || session.workspaceProgress != nil || !session.capabilities.contains("workspace.open"))
+            .accessibilityIdentifier("project-open-in-zed")
+            if let progress = session.workspaceProgress {
+                Text(progress).font(.caption).foregroundStyle(ZLTheme.muted)
+            } else if !session.workspaceIssue.isEmpty {
+                Text(session.workspaceIssue).font(.caption).foregroundStyle(ZLTheme.warning)
+            }
+        }
     }
 
     private var previewAttachable: Bool {
