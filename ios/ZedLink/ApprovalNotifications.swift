@@ -327,7 +327,8 @@ final class ZedLinkAPNsDelegate: NSObject, UIApplicationDelegate {
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .list, .sound])
+        // `.badge`: gateway pushes carry `aps.badge` = this device's unread total (wave 3 §2).
+        completionHandler([.banner, .list, .sound, .badge])
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,

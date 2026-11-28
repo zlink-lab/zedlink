@@ -25,9 +25,10 @@ import Foundation
     }
     func enqueue(id rawID: String, data: [String: String], action: String) {
         prune()
-        // Gateway pushes (`push`) only open their thread, like the local review-only alerts. Their
-        // instance/epoch may be stale after a Zed restart, so only the routing fields are required.
-        let gatewayPush = ["push", "push_test"].contains(data["type"] ?? "")
+        // Gateway pushes (`push`, any `event` including wave 3 `autopilot`) only open their thread,
+        // like the local review-only alerts. Their instance/epoch may be stale after a Zed restart,
+        // so only the routing fields are required. A bare `type: autopilot` is accepted the same way.
+        let gatewayPush = ["push", "push_test", "autopilot"].contains(data["type"] ?? "")
         // `zed_hung` names a connection and Zed target only: no instance, epoch or thread.
         let zedAlert = data["type"] == "zed_hung"
         let reviewOnly = gatewayPush || zedAlert || ["agent_error", "turn_status", "compaction", "input_needed"].contains(data["type"] ?? "")

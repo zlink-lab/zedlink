@@ -569,6 +569,10 @@ private struct SessionRow: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var session: SessionManager
     @EnvironmentObject private var library: SessionLibrary
+    @EnvironmentObject private var extras: GatewayExtrasStore
+    /// Set after the first appearance: coming back to this tab re-selects the thread if another
+    /// tab's stack selected a different one meanwhile.
+    @State private var appearedOnce = false
     @ObservedObject private var composerLibrary = ComposerLibrary.shared
     let threadID: String
     @State private var showingClearConfirmation = false
@@ -722,6 +726,17 @@ private struct SessionRow: View {
         return [threadID, profileID, targetID, instanceID, epoch, String(session.state == .live), String(isExposed)]
     }
 
+    /// Changes when this thread shows new events, so they are marked read (`summary.mark_read`).
+    private var readMarkKey: String {
+        guard let snapshot = session.snapshot, snapshot.threadID == threadID, session.state == .live else { return "" }
+        return [threadID, snapshot.instanceID, snapshot.epoch, String(snapshot.lastSequence)].joined(separator: "|")
+    }
+
+    private func markRead() {
+        guard !readMarkKey.isEmpty, !session.demoPreview, let profile = session.profile, let targetID = session.targetID else { return }
+        extras.markRead(profile: profile, targetID: targetID, threadID: threadID)
+    }
+
     private func loadConversation() async {
         guard session.state == .live else { return }
         if !session.threads.contains(where: { $0.id == threadID }) {
@@ -745,6 +760,20 @@ private struct SessionRow: View {
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         .task(id: conversationTaskID) { await loadConversation() }
+        .onAppear {
+            // Only a thread of the current connection (never `thread.open` on another gateway).
+            if appearedOnce, session.state == .live, session.selectedThreadID != threadID, isExposed {
+                Task { await loadConversation() }
+            }
+            appearedOnce = true
+        }
+        .task(id: readMarkKey) { markRead() }
+        .task(id: session.profile?.gatewayID ?? "") {
+            // The autopilot strip needs `autopilot.status`; Summary usually loaded it already.
+            guard let profile = session.profile, !session.demoPreview,
+                  extras.autopilotStatus(gatewayID: profile.gatewayID) == nil else { return }
+            await extras.refreshAutopilot(profile)
+        }
         .onChange(of: session.snapshot?.title) { _, title in
             if session.snapshot?.threadID == threadID, let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { lastKnownTitle = title }
         }
@@ -975,6 +1004,7 @@ private struct SessionRow: View {
                     headerTitle.padding(.horizontal, 12).padding(.bottom, 8)
                 }
             }.padding(.horizontal, 8).padding(.vertical, 4).buttonStyle(.plain)
+            AutopilotThreadStrip(threadID: threadID, threadTitle: lastKnownTitle.isEmpty ? "Agent thread" : lastKnownTitle)
             Hairline()
         }.background(ZLTheme.background).foregroundStyle(ZLTheme.ink)
     }
@@ -1131,6 +1161,8 @@ private struct SessionRow: View {
                             .background { if entryIndex == reviewIndex { reviewPosition } }
                         Hairline().padding(.horizontal, 14)
                     }
+                    AutopilotThreadNotes(threadID: snapshot.threadID,
+                                         trigger: [snapshot.status, String(snapshot.currentTurnID ?? -1), String(snapshot.totalEntries)].joined(separator: "|"))
                     if !fallbackApprovals.isEmpty {
                         approvalStack(fallbackApprovals).id("pending-review")
                             .background { if reviewIndex == nil { reviewPosition } }
@@ -1371,6 +1403,7 @@ private struct SessionRow: View {
                     .lineLimit(2).accessibilityIdentifier("delivery-status")
             }
             if session.pending != nil { uncertainDelivery }
+            if let note = session.autopilotNote { autopilotNoteRow(note) }
             if session.draft.hasPrefix("/"), session.draft != dismissedSlashDraft, !session.draft.contains(where: { $0.isWhitespace }) {
                 NativeSlashSuggestions(commands: session.commands, query: String(session.draft.dropFirst())) { command in
                     session.insertCommand(command); dismissedSlashDraft = session.draft
@@ -1641,6 +1674,19 @@ private struct SessionRow: View {
             pendingCommandReplacement = command
             if !fromSheet { showingCommandReplacement = true }
         }
+    }
+
+    /// The gateway's reply to a `/auto …` command; the command never reached the agent.
+    private func autopilotNoteRow(_ note: String) -> some View {
+        HStack(spacing: 8) {
+            Label(note, systemImage: "bolt.circle")
+                .font(.caption).foregroundStyle(ZLTheme.ink)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button { session.dismissAutopilotNote() } label: { Image(systemName: "xmark").frame(width: 32, height: 32) }
+                .accessibilityLabel("Скрыть")
+        }
+        .padding(.horizontal, 12)
+        .accessibilityIdentifier("autopilot-command-note")
     }
 
     private var uncertainDelivery: some View {

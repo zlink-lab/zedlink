@@ -106,10 +106,11 @@ import Network
         guard file.data.count <= ProjectUploader.maxBytes else { issue = "Files can be up to 25 MiB."; return }
         let id = UUID()
         uploads.append(ComposerUpload(id: id, name: file.fileName, mimeType: file.mimeType, size: file.data.count))
+        let projectID: String? = threads.first(where: { $0.id == threadID })?.projectID ?? historyThread(threadID)?.projectID
         uploadTasks[id] = Task { [weak self] in
             do {
                 let committed: CommittedUpload = try await ProjectUploader.upload(
-                    client: client, instanceID: instanceID, epoch: epoch, threadID: threadID, projectID: nil, file: file
+                    client: client, instanceID: instanceID, epoch: epoch, threadID: threadID, projectID: projectID, file: file
                 ) { fraction in
                     guard let self, let index = self.uploads.firstIndex(where: { $0.id == id }) else { return }
                     self.uploads[index].progress = fraction
@@ -149,11 +150,23 @@ import Network
     @Published private(set) var creatingThread = false
     @Published private(set) var selectedThreadID: String?
     @Published var notificationThreadID: String?
+    /// A thread to push on the Summary tab's stack (Summary rows and push taps, §6.7).
+    @Published var summaryThreadID: String?
+    /// The tab the user is on; a thread created from a conversation opens on that tab's stack.
+    var visibleStack: ThreadDestination = .sessions
+    /// The selected thread's project is not open in Zed (`PROJECT_NOT_OPEN`, closed SSH project):
+    /// the file browser offers "Открыть в Zed".
+    @Published private(set) var projectNotOpen = false
     @Published private(set) var delivery = ""
     @Published private(set) var issue = ""
     @Published private(set) var controlsIssue = ""
     @Published private(set) var notificationNeedsWorkspace = false
     @Published private(set) var pending: PendingSend?
+    /// The gateway's answer to an intercepted `/auto …` command (`result.intercepted == "autopilot"`).
+    @Published private(set) var autopilotNote: String?
+    private var autopilotNoteTask: Task<Void, Never>?
+    /// Bumped when `EndpointSelection` switches the active address, so route labels redraw.
+    @Published private(set) var routeRevision = 0
     @Published var draft = "" {
         didSet {
             guard let profile, let selectedThreadID else { return }
@@ -297,7 +310,7 @@ import Network
         threadSettings = nil
         ApprovalNotifications.shared.clear()
         previewRequest = UUID(); previewReadable = false; previewLoading = false; previewTruncated = false; projectFilesTruncated = false
-        projectFolderEntries = nil; directoryRequest = UUID()
+        projectFolderEntries = nil; directoryRequest = UUID(); projectNotOpen = false
         projectFiles = []; changes = []; changesRevision = nil; terminals = []; terminalSnapshot = nil; configuredTasks = []; debuggerCatalog = []; debuggerSessions = []; previewTitle = ""; previewContent = ""; contextPaths = []
         creatingThread = false
         pending = nil
@@ -947,8 +960,13 @@ import Network
         }
     }
 
-    /// Opens a thread in the Sessions navigation stack (same path as notification taps).
-    func navigate(toThread id: String) { notificationThreadID = id }
+    /// Opens a thread on the navigation stack of the tab in use (Sessions or Summary).
+    func navigate(toThread id: String) {
+        switch visibleStack {
+        case .sessions: notificationThreadID = id
+        case .summary: summaryThreadID = id
+        }
+    }
 
     /// The workspace that owns `thread`, from `workspace.list`.
     func workspaceLocation(for thread: NativeThread) -> WorkspaceLocation? {
@@ -1104,7 +1122,7 @@ import Network
             diffContent = ""; diffLoading = false; diffRequest = UUID()
             previewRequest = UUID(); previewReadable = false; previewLoading = false; previewContent = ""; previewTitle = ""
             projectFolderEntries = nil; directoryRequest = UUID()
-            projectFiles = []; projectFilesTruncated = false
+            projectFiles = []; projectFilesTruncated = false; projectNotOpen = false
             snapshot = nil
             lastSnapshotAt = nil
             controlsIssue = ""
@@ -1706,14 +1724,23 @@ import Network
             try checkIdentity(info)
             capabilities = Set(info["capabilities"] as? [String] ?? [])
             let base: [String: Any] = ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": threadID]
+            let fileBase: [String: Any] = ["instance_id": instanceID ?? "", "epoch": epoch ?? ""]
             if page == nil || page == .files {
                 if capabilities.contains("project.files") {
-                    let result = try await client.rpc("project.files", params: base)
-                    guard current() else { return }
-                    projectFilesTruncated = result["truncated"] as? Bool ?? false
-                    projectFiles = (result["entries"] as? [[String: Any]] ?? []).compactMap { row in
-                        guard let path = row["path"] as? String else { return nil }
-                        return NativeProjectFile(id: path, kind: row["kind"] as? String ?? "file", size: row["size"] as? Int)
+                    do {
+                        let result = try await projectRPC(client, "project.files", threadID: threadID, params: fileBase)
+                        guard current() else { return }
+                        projectNotOpen = false
+                        projectFilesTruncated = result["truncated"] as? Bool ?? false
+                        projectFiles = (result["entries"] as? [[String: Any]] ?? []).compactMap { row in
+                            guard let path = row["path"] as? String else { return nil }
+                            return NativeProjectFile(id: path, kind: row["kind"] as? String ?? "file", size: row["size"] as? Int)
+                        }
+                    } catch let error as GatewayFailure where error.isProjectNotOpen {
+                        guard current() else { return }
+                        projectNotOpen = true
+                        projectFiles = []
+                        projectFilesTruncated = false
                     }
                 }
             }
@@ -2118,13 +2145,30 @@ import Network
         return hostID
     }
 
+    /// Project file requests name the thread. A saved thread of a project that is closed in Zed is
+    /// not loaded (`THREAD_NOT_LOADED`), so the request is retried by `project_id`, which the
+    /// bridge serves from disk for closed local projects (wave 3 §6.3).
+    private func projectRPC(_ client: GatewayClient, _ method: String, threadID: String, params: [String: Any]) async throws -> [String: Any] {
+        var withThread = params
+        withThread["thread_id"] = threadID
+        do {
+            return try await client.rpc(method, params: withThread)
+        } catch let error as GatewayFailure where error.isThreadNotLoaded {
+            let projectID = threads.first(where: { $0.id == threadID })?.projectID ?? historyThread(threadID)?.projectID
+            guard let projectID, !projectID.isEmpty else { throw error }
+            var withProject = params
+            withProject["project_id"] = projectID
+            return try await client.rpc(method, params: withProject)
+        }
+    }
+
     func loadDirectory(_ path: String) async {
         projectFolderEntries = nil; projectFolderTruncated = false
         guard capabilities.contains("project.directory"), let client, let thread = selectedThreadID else { return }
         let request = UUID(); directoryRequest = request
         let scope = (profile?.id, targetID, instanceID, epoch)
         do {
-            let result = try await client.rpc("project.directory", params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": thread, "path": path])
+            let result = try await projectRPC(client, "project.directory", threadID: thread, params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "path": path])
             guard request == directoryRequest, thread == selectedThreadID, scope.0 == profile?.id,
                   scope.1 == targetID, scope.2 == instanceID, scope.3 == epoch else { return }
             guard result["directory"] as? String == path, let rows = result["entries"] as? [[String: Any]] else { throw GatewayFailure.invalidResponse }
@@ -2133,7 +2177,12 @@ import Network
                 return NativeProjectFile(id: path, kind: row["kind"] as? String ?? "file", size: row["size"] as? Int)
             }
             projectFolderTruncated = result["truncated"] as? Bool ?? false
-        } catch { if request == directoryRequest { issue = error.localizedDescription } }
+            projectNotOpen = false
+        } catch {
+            guard request == directoryRequest else { return }
+            if (error as? GatewayFailure)?.isProjectNotOpen == true { projectNotOpen = true }
+            else { issue = error.localizedDescription }
+        }
     }
 
     func previewFile(_ path: String) async {
@@ -2142,7 +2191,7 @@ import Network
         let scope = (profile?.id, targetID, instanceID, epoch, threadID)
         previewTitle = path; previewContent = ""; previewReadable = false; previewLoading = true; previewTruncated = false
         do {
-            let result = try await client.rpc("project.file", params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": threadID, "path": path])
+            let result = try await projectRPC(client, "project.file", threadID: threadID, params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "path": path])
             guard request == previewRequest, scope.0 == profile?.id, scope.1 == targetID,
                   scope.2 == instanceID, scope.3 == epoch, scope.4 == selectedThreadID else { return }
             guard result["path"] as? String == path, let content = result["content"] as? String else {
@@ -2154,6 +2203,11 @@ import Network
             guard request == previewRequest, scope.0 == profile?.id, scope.1 == targetID,
                   scope.2 == instanceID, scope.3 == epoch, scope.4 == selectedThreadID else { return }
             previewLoading = false; previewContent = "File unavailable: " + error.localizedDescription
+            if (error as? GatewayFailure)?.isProjectNotOpen == true { projectNotOpen = true }
+            else if case GatewayFailure.native("UNSUPPORTED_CAPABILITY") = error {
+                // The bridge lists files of open remote (SSH) projects but cannot read them yet.
+                previewContent = "Файлы этого удалённого проекта Zed пока не отдаёт на телефон (UNSUPPORTED_CAPABILITY)."
+            }
         }
     }
 
@@ -2186,7 +2240,7 @@ import Network
         let scope = operationScope; let request = UUID(); searchRequest = request
         for _ in 0..<40 {
             try Task.checkCancellation()
-            let result = try await client.rpc("project.search", params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "thread_id": thread, "query": query, "case_sensitive": false])
+            let result = try await projectRPC(client, "project.search", threadID: thread, params: ["instance_id": instanceID ?? "", "epoch": epoch ?? "", "query": query, "case_sensitive": false])
             guard scope == operationScope, searchRequest == request else { throw CancellationError() }
             if result["outcome"] as? String == "ready" {
                 let matches = (result["matches"] as? [[String: Any]] ?? []).compactMap { row -> ProjectSearchMatch? in
@@ -2422,10 +2476,11 @@ import Network
         }
         guard state != .connecting else { issue = "Connection is still restoring. Open the session to review current requests."; return }
         if data["type"] == "push_test" { return }
-        if data["type"] == "push", let gateway = data["gateway"], let thread = data["thread"] {
+        if data["type"] == "push" || data["type"] == "autopilot", let gateway = data["gateway"], let thread = data["thread"] {
             // Gateway pushes name the connection, workspace and thread; open it wherever it lives.
             _ = await openThread(gatewayID: gateway, targetID: data["target"], threadID: thread,
-                                 hostID: data["host_id"], projectID: data["project_id"], profiles: profiles)
+                                 hostID: data["host_id"], projectID: data["project_id"], profiles: profiles,
+                                 destination: .summary)
             return
         }
         if state != .live { await refresh() }
@@ -2441,7 +2496,8 @@ import Network
         await select(thread)
         guard state == .live, issue.isEmpty, data["gateway"] == profile?.gatewayID, data["target"] == targetID,
               data["instance"] == instanceID, data["epoch"] == epoch, thread == selectedThreadID else { return }
-        notificationThreadID = thread
+        // Push taps open the thread on the Summary tab's stack (§6.7).
+        summaryThreadID = thread
         guard action == "approve" || action == "deny" else { return }
         guard let approval = snapshot?.pendingApprovals.first(where: {
             $0.id == data["approval"] && String($0.turnID ?? -1) == data["turn"] && ($0.subagentID ?? "") == data["child"]
@@ -2460,7 +2516,8 @@ import Network
     /// to the thread's workspace, loads the thread in Zed if needed and opens its conversation.
     /// Used by push taps and the Summary tab.
     func openThread(gatewayID: String, targetID requestedTarget: String?, threadID: String,
-                    hostID: String?, projectID: String?, profiles: [ConnectionProfile]) async -> Bool {
+                    hostID: String?, projectID: String?, profiles: [ConnectionProfile],
+                    destination: ThreadDestination = .sessions) async -> Bool {
         let target: String? = requestedTarget.flatMap { $0.isEmpty ? nil : $0 }
         let sameGateway: Bool = profile?.gatewayID.caseInsensitiveCompare(gatewayID) == .orderedSame
         if !sameGateway || (target != nil && target != targetID) || state != .live {
@@ -2496,7 +2553,10 @@ import Network
             guard await recoverThread(threadID) else { notificationNeedsWorkspace = true; return false }
         }
         if notificationNeedsWorkspace { clearIssue() }
-        notificationThreadID = threadID
+        switch destination {
+        case .sessions: notificationThreadID = threadID
+        case .summary: summaryThreadID = threadID
+        }
         return true
     }
 
@@ -2570,6 +2630,15 @@ import Network
         do {
             let result = try await client.rpc("thread.send", params: pending.submissionParams, requestID: pending.id)
             guard scope == operationScope, self.pending?.id == pending.id else { return }
+            if let note = AutopilotInterception.message(in: result) {
+                // `/auto …` was handled by the gateway and never reached the agent: no receipt to
+                // wait for, no pending bubble, the draft is done.
+                if draft.trimmingCharacters(in: .whitespacesAndNewlines) == pending.text { draft = "" }
+                settlePending()
+                delivery = ""
+                showAutopilotNote(note)
+                return
+            }
             let outcome = result["outcome"] as? String ?? "received"
             if draft.trimmingCharacters(in: .whitespacesAndNewlines) == pending.text { draft = "" }
             contextPaths.subtract(pending.contextPaths)
@@ -2687,6 +2756,69 @@ import Network
             if pending != nil { delivery = "Previous send has uncertain delivery. Check its status before another send." }
         }
     }
+}
+
+// MARK: Wave 3: autopilot notes, the active gateway address, closed projects
+
+/// Which tab's navigation stack a programmatically opened thread is pushed on (§6.7).
+enum ThreadDestination {
+    case sessions
+    case summary
+}
+
+extension SessionManager {
+    /// "Открыть в Zed" after `PROJECT_NOT_OPEN`: opens the selected thread's workspace the way
+    /// Zed's sidebar does (`workspace.open`), then reloads the file listing.
+    @discardableResult
+    func openSelectedThreadProject() async -> Bool {
+        guard let threadID = selectedThreadID, let thread = threads.first(where: { $0.id == threadID }) else { return false }
+        if supportsWorkspaces && workspaceHosts.isEmpty { await loadWorkspaces() }
+        guard let location = workspaceLocation(for: thread) else {
+            issue = "Не удалось определить проект этого треда. Откройте его в Zed на компьютере."
+            return false
+        }
+        guard capabilities.contains("workspace.open") else {
+            issue = "Откройте \(location.project.name) в Zed на компьютере."
+            return false
+        }
+        guard await openWorkspace(host: location.host, paths: location.project.paths, name: location.project.name) else {
+            if workspaceIssue.isEmpty { issue = "Zed не смог открыть \(location.project.name)." }
+            return false
+        }
+        projectNotOpen = false
+        await loadProjectContext(page: .files)
+        return true
+    }
+
+    func showAutopilotNote(_ message: String) {
+        autopilotNote = message
+        autopilotNoteTask?.cancel()
+        autopilotNoteTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled, let self, self.autopilotNote == message else { return }
+            self.autopilotNote = nil
+        }
+    }
+
+    func dismissAutopilotNote() {
+        autopilotNoteTask?.cancel(); autopilotNoteTask = nil
+        autopilotNote = nil
+    }
+
+    /// The configured address (main or mesh) requests of the current connection go to.
+    var activeEndpoint: String? {
+        _ = routeRevision
+        guard let profile else { return nil }
+        return EndpointSelection.shared.active(for: profile)
+    }
+
+    /// "через локалку" / "через mesh" for the current connection.
+    var activeRouteLabel: String? {
+        guard let profile, let endpoint = activeEndpoint else { return nil }
+        return profile.routeLabel(for: endpoint)
+    }
+
+    func endpointSelectionChanged() { routeRevision &+= 1 }
 }
 
 // MARK: Zed control (gateway-level `zed.status` / `zed.start` / `zed.restart`)

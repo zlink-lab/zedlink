@@ -1,15 +1,27 @@
 import SwiftUI
 
+/// Screens pushed on the Summary tab's own navigation stack (§6.7): a thread opened here (or from
+/// a push) pops back to Summary, not to the Sessions list.
+enum SummaryRoute: Hashable {
+    case thread(String)
+    case limits
+    case statistics
+    case autopilotHistory
+}
+
 /// "Сводка": recent threads across every saved connection, host and workspace, newest first.
 /// Rows are kept on the phone, so the tab still reads when a gateway is offline.
 struct SummaryView: View {
     @EnvironmentObject private var session: SessionManager
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var summary: SummaryStore
-    @Binding var selectedTab: Int
+    @EnvironmentObject private var extras: GatewayExtrasStore
+    @Binding var path: [SummaryRoute]
     @State private var search = ""
     @State private var historyLimit = 40
     @State private var opening: String?
+    /// Why the last tapped thread could not be opened (the Sessions tab shows the full issue).
+    @State private var openIssue = ""
 
     private let recentWindow: TimeInterval = 3 * 24 * 60 * 60
 
@@ -28,9 +40,12 @@ struct SummaryView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List {
+                limitsSection
                 statusSection
+                AutopilotSummarySection()
+                statisticsLink
                 recentSection
                 historySection
             }
@@ -39,21 +54,57 @@ struct SummaryView: View {
             .navigationTitle("Сводка").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { Task { await summary.refresh(profiles: profiles.profiles) } } label: {
+                    Button { Task { await refreshAll() } } label: {
                         if summary.refreshing { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.clockwise") }
                     }
                     .disabled(summary.refreshing || profiles.profiles.isEmpty)
                     .accessibilityLabel("Refresh summary")
                 }
             }
-            .refreshable { await summary.refresh(profiles: profiles.profiles) }
+            .refreshable { await refreshAll() }
             .task {
                 while !Task.isCancelled {
-                    await summary.refresh(profiles: profiles.profiles)
+                    await refreshAll()
                     try? await Task.sleep(for: .seconds(60))
                 }
             }
             .onChange(of: search) { _, _ in historyLimit = 40 }
+            .navigationDestination(for: SummaryRoute.self) { route in
+                switch route {
+                case .thread(let threadID): ConversationView(threadID: threadID)
+                case .limits: LimitsView()
+                case .statistics: StatisticsView()
+                case .autopilotHistory: AutopilotHistoryView(scope: AutopilotHistoryScope())
+                }
+            }
+        }
+    }
+
+    /// "Статистика": shown once any saved gateway reports limits or the autopilot (wave 3).
+    @ViewBuilder private var statisticsLink: some View {
+        if extras.allLimitAgents > 0 || !extras.autopilot.isEmpty {
+            NavigationLink(value: SummaryRoute.statistics) {
+                Label("Статистика токенов и лимитов", systemImage: "chart.bar.xaxis")
+                    .font(.subheadline)
+            }
+            .listRowBackground(ZLTheme.background)
+            .accessibilityIdentifier("summary-statistics")
+        }
+    }
+
+    /// Threads, then unread counts, limits and the autopilot of every saved gateway.
+    private func refreshAll() async {
+        await summary.refresh(profiles: profiles.profiles)
+        await extras.refresh(profiles: profiles.profiles, preferring: session.profile)
+    }
+
+    /// Subscription limits (`limits.list`); tap for every window. Hidden without data.
+    @ViewBuilder private var limitsSection: some View {
+        if extras.allLimitAgents > 0 {
+            NavigationLink(value: SummaryRoute.limits) { LimitsCard(limits: extras.limits) }
+                .listRowBackground(ZLTheme.background)
+                .listRowSeparator(.hidden)
+                .accessibilityIdentifier("summary-limits")
         }
     }
 
@@ -61,6 +112,15 @@ struct SummaryView: View {
         if profiles.profiles.isEmpty {
             Text("Pair a gateway in Settings › Connections to see its threads here.")
                 .font(.subheadline).foregroundStyle(ZLTheme.muted)
+        }
+        if !openIssue.isEmpty {
+            Button { openIssue = "" } label: {
+                Label(openIssue, systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(ZLTheme.warning)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Скрывает сообщение")
         }
         ForEach(summary.issues.keys.sorted(), id: \.self) { name in
             Label("\(name): \(summary.issues[name] ?? "") · showing last known", systemImage: "wifi.exclamationmark")
@@ -96,22 +156,27 @@ struct SummaryView: View {
     }
 
     private func row(_ entry: SummaryEntry) -> some View {
-        Button { open(entry) } label: { SummaryRow(entry: entry, opening: opening == entry.id) }
+        Button { open(entry) } label: {
+            SummaryRow(entry: entry, opening: opening == entry.id, unread: extras.unreadCount(entry.id))
+        }
             .buttonStyle(.plain)
             .disabled(opening != nil)
             .listRowBackground(ZLTheme.background)
             .accessibilityIdentifier("summary-thread-" + entry.threadID)
     }
 
+    /// Opens the thread on this tab's stack (`summaryThreadID`), so back returns to Summary.
     private func open(_ entry: SummaryEntry) {
         opening = entry.id
+        openIssue = ""
         Task {
             defer { opening = nil }
-            selectedTab = 0
             let opened: Bool = await session.openThread(gatewayID: entry.gatewayID, targetID: entry.targetID,
                                                         threadID: entry.threadID, hostID: entry.hostID,
-                                                        projectID: entry.projectID, profiles: profiles.profiles)
+                                                        projectID: entry.projectID, profiles: profiles.profiles,
+                                                        destination: .summary)
             if opened, let profile = session.profile { profiles.markUsed(profile) }
+            else if !opened { openIssue = session.issue.isEmpty ? "Не удалось открыть тред." : session.issue }
         }
     }
 }
@@ -119,6 +184,8 @@ struct SummaryView: View {
 private struct SummaryRow: View {
     let entry: SummaryEntry
     let opening: Bool
+    /// Agent events since this device last read the thread (`summary.unread`); 0 hides it.
+    var unread: Int = 0
 
     private var tint: Color {
         switch entry.status {
@@ -141,6 +208,15 @@ private struct SummaryRow: View {
                 Text(meta).font(.caption).foregroundStyle(ZLTheme.muted).lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            if unread > 0 {
+                Text(unread > 99 ? "99+" : String(unread))
+                    .font(.caption2.weight(.bold).monospacedDigit())
+                    .foregroundStyle(ZLTheme.background)
+                    .padding(.horizontal, 6).frame(minWidth: 20, minHeight: 20)
+                    .background(ZLTheme.focus, in: Capsule())
+                    .accessibilityLabel("Непрочитанных: \(unread)")
+                    .accessibilityIdentifier("summary-unread-" + entry.threadID)
+            }
             Image(systemName: "chevron.right").font(.caption).foregroundStyle(ZLTheme.muted)
         }
         .padding(.vertical, 6)

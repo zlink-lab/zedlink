@@ -6,6 +6,8 @@ enum RouteKind: String, CaseIterable, Codable, Identifiable {
     case otherVPN = "Other VPN"
     case local = "Local HTTPS"
     case custom = "Custom HTTPS"
+    /// A Yggdrasil address (200::/7) of the same gateway.
+    case mesh = "Mesh (Yggdrasil)"
 
     var id: String { rawValue }
 
@@ -16,6 +18,7 @@ enum RouteKind: String, CaseIterable, Codable, Identifiable {
         case .otherVPN: "Connect a VPN that routes to the workstation, then enter its HTTPS address."
         case .local: "Join the same trusted local network and use a certificate valid for the entered hostname."
         case .custom: "Enter the HTTPS address of a trusted reverse proxy that forwards ZedLink API requests."
+        case .mesh: "Run Yggdrasil on this iPhone, then enter the gateway's HTTPS address in 200::/7, for example https://[201:abcd::1]:8443."
         }
     }
 
@@ -28,6 +31,7 @@ enum RouteKind: String, CaseIterable, Codable, Identifiable {
         if host.isEmpty { return nil }
         if host.hasSuffix(".ts.net") { return .tailscale }
         if host.contains(":") {
+            if isYggdrasil(host) { return .mesh }
             if host.hasPrefix("fd7a:115c:a1e0:") { return .tailscale }
             if host.hasPrefix("fc") || host.hasPrefix("fd") || host.hasPrefix("fe80:") || host == "::1" { return .local }
             return nil
@@ -47,6 +51,15 @@ enum RouteKind: String, CaseIterable, Codable, Identifiable {
         }
         return nil
     }
+
+    /// Yggdrasil addresses and subnets: 200::/7, i.e. a first hextet of 0x0200–0x03ff.
+    static func isYggdrasil(_ rawHost: String) -> Bool {
+        let host: String = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        guard host.contains(":"), !host.hasPrefix(":") else { return false }
+        guard let first = host.split(separator: ":", omittingEmptySubsequences: false).first,
+              (1...4).contains(first.count), let value = Int(first, radix: 16) else { return false }
+        return (0x0200...0x03ff).contains(value)
+    }
 }
 
 struct ConnectionProfile: Codable, Identifiable, Equatable {
@@ -55,6 +68,34 @@ struct ConnectionProfile: Codable, Identifiable, Equatable {
     var route: RouteKind
     var endpoint: String
     var gatewayID: String
+    /// A second address of the same gateway on the Yggdrasil mesh. Optional: profiles saved before
+    /// it existed decode without it (synthesized Codable uses `decodeIfPresent` for optionals).
+    var meshEndpoint: String? = nil
+    /// The address (`endpoint` or `meshEndpoint`) that passed the identity check last.
+    var lastWorkingEndpoint: String? = nil
+
+    /// The configured addresses of this gateway: the main one first, then the mesh one.
+    var endpoints: [String] {
+        guard let mesh = meshEndpoint?.trimmingCharacters(in: .whitespacesAndNewlines), !mesh.isEmpty,
+              mesh != endpoint else { return [endpoint] }
+        return [endpoint, mesh]
+    }
+
+    /// Where a connection attempt starts: the address that worked last, else the main one.
+    var preferredEndpoint: String {
+        if let last = lastWorkingEndpoint, endpoints.contains(last) { return last }
+        return endpoint
+    }
+
+    func isMeshEndpoint(_ address: String) -> Bool {
+        endpoints.count > 1 && address == endpoints[1]
+    }
+
+    /// "через локалку" / "через mesh" for the address in use.
+    func routeLabel(for address: String) -> String {
+        if isMeshEndpoint(address) || (address == endpoint && route == .mesh) { return "через mesh" }
+        return route == .local ? "через локалку" : "через \(route.rawValue)"
+    }
 }
 
 struct ZedTarget: Identifiable, Equatable {
