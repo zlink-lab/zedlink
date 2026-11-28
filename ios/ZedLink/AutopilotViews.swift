@@ -384,11 +384,24 @@ struct ContinueAtSheet: View {
     @Environment(\.dismiss) private var dismiss
     let threadTitle: String
     let defaultText: String
+    let heading: String
+    let note: String
     let schedule: (Date, String?) async -> String?
     @State private var date = ContinueAtSheet.defaultDate()
-    @State private var text = ""
+    @State private var text: String
     @State private var busy = false
     @State private var issue = ""
+
+    init(threadTitle: String, defaultText: String, heading: String = "Продолжить в…",
+         note: String = "Gateway отправит текст в этот тред в выбранное время; занятый тред поставит его в очередь. Не дальше 7 дней.",
+         initialText: String = "", schedule: @escaping (Date, String?) async -> String?) {
+        self.threadTitle = threadTitle
+        self.defaultText = defaultText
+        self.heading = heading
+        self.note = note
+        self.schedule = schedule
+        _text = State(initialValue: initialText)
+    }
 
     private static func defaultDate() -> Date {
         let next = Date().addingTimeInterval(60 * 60)
@@ -410,7 +423,7 @@ struct ContinueAtSheet: View {
                     DatePicker("Когда", selection: $date, in: range, displayedComponents: [.date, .hourAndMinute])
                         .accessibilityIdentifier("autopilot-continue-at")
                 } footer: {
-                    Text("Gateway отправит текст в этот тред в выбранное время, если тред свободен и не ждёт подтверждения. Не дальше 7 дней.")
+                    Text(note)
                 }
                 Section("Текст") {
                     TextField(defaultText.isEmpty ? "продолжай" : defaultText, text: $text, axis: .vertical)
@@ -421,7 +434,7 @@ struct ContinueAtSheet: View {
                     Section { Text(issue).foregroundStyle(ZLTheme.danger).font(.footnote) }
                 }
             }
-            .navigationTitle("Продолжить в…").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(heading).navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Отмена") { dismiss() }.disabled(busy) }
                 ToolbarItem(placement: .confirmationAction) {
