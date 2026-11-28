@@ -149,11 +149,18 @@ import Network
     @Published private(set) var creatingThread = false
     @Published private(set) var selectedThreadID: String?
     @Published var notificationThreadID: String?
+    /// A thread to push on the Summary tab's stack (Summary rows and push taps, §6.7).
+    @Published var summaryThreadID: String?
+    /// The tab the user is on; a thread created from a conversation opens on that tab's stack.
+    var visibleStack: ThreadDestination = .sessions
     @Published private(set) var delivery = ""
     @Published private(set) var issue = ""
     @Published private(set) var controlsIssue = ""
     @Published private(set) var notificationNeedsWorkspace = false
     @Published private(set) var pending: PendingSend?
+    /// The gateway's answer to an intercepted `/auto …` command (`result.intercepted == "autopilot"`).
+    @Published private(set) var autopilotNote: String?
+    private var autopilotNoteTask: Task<Void, Never>?
     /// Bumped when `EndpointSelection` switches the active address, so route labels redraw.
     @Published private(set) var routeRevision = 0
     @Published var draft = "" {
@@ -949,8 +956,13 @@ import Network
         }
     }
 
-    /// Opens a thread in the Sessions navigation stack (same path as notification taps).
-    func navigate(toThread id: String) { notificationThreadID = id }
+    /// Opens a thread on the navigation stack of the tab in use (Sessions or Summary).
+    func navigate(toThread id: String) {
+        switch visibleStack {
+        case .sessions: notificationThreadID = id
+        case .summary: summaryThreadID = id
+        }
+    }
 
     /// The workspace that owns `thread`, from `workspace.list`.
     func workspaceLocation(for thread: NativeThread) -> WorkspaceLocation? {
@@ -2424,10 +2436,11 @@ import Network
         }
         guard state != .connecting else { issue = "Connection is still restoring. Open the session to review current requests."; return }
         if data["type"] == "push_test" { return }
-        if data["type"] == "push", let gateway = data["gateway"], let thread = data["thread"] {
+        if data["type"] == "push" || data["type"] == "autopilot", let gateway = data["gateway"], let thread = data["thread"] {
             // Gateway pushes name the connection, workspace and thread; open it wherever it lives.
             _ = await openThread(gatewayID: gateway, targetID: data["target"], threadID: thread,
-                                 hostID: data["host_id"], projectID: data["project_id"], profiles: profiles)
+                                 hostID: data["host_id"], projectID: data["project_id"], profiles: profiles,
+                                 destination: .summary)
             return
         }
         if state != .live { await refresh() }
@@ -2443,7 +2456,8 @@ import Network
         await select(thread)
         guard state == .live, issue.isEmpty, data["gateway"] == profile?.gatewayID, data["target"] == targetID,
               data["instance"] == instanceID, data["epoch"] == epoch, thread == selectedThreadID else { return }
-        notificationThreadID = thread
+        // Push taps open the thread on the Summary tab's stack (§6.7).
+        summaryThreadID = thread
         guard action == "approve" || action == "deny" else { return }
         guard let approval = snapshot?.pendingApprovals.first(where: {
             $0.id == data["approval"] && String($0.turnID ?? -1) == data["turn"] && ($0.subagentID ?? "") == data["child"]
@@ -2462,7 +2476,8 @@ import Network
     /// to the thread's workspace, loads the thread in Zed if needed and opens its conversation.
     /// Used by push taps and the Summary tab.
     func openThread(gatewayID: String, targetID requestedTarget: String?, threadID: String,
-                    hostID: String?, projectID: String?, profiles: [ConnectionProfile]) async -> Bool {
+                    hostID: String?, projectID: String?, profiles: [ConnectionProfile],
+                    destination: ThreadDestination = .sessions) async -> Bool {
         let target: String? = requestedTarget.flatMap { $0.isEmpty ? nil : $0 }
         let sameGateway: Bool = profile?.gatewayID.caseInsensitiveCompare(gatewayID) == .orderedSame
         if !sameGateway || (target != nil && target != targetID) || state != .live {
@@ -2498,7 +2513,10 @@ import Network
             guard await recoverThread(threadID) else { notificationNeedsWorkspace = true; return false }
         }
         if notificationNeedsWorkspace { clearIssue() }
-        notificationThreadID = threadID
+        switch destination {
+        case .sessions: notificationThreadID = threadID
+        case .summary: summaryThreadID = threadID
+        }
         return true
     }
 
@@ -2572,6 +2590,15 @@ import Network
         do {
             let result = try await client.rpc("thread.send", params: pending.submissionParams, requestID: pending.id)
             guard scope == operationScope, self.pending?.id == pending.id else { return }
+            if let note = AutopilotInterception.message(in: result) {
+                // `/auto …` was handled by the gateway and never reached the agent: no receipt to
+                // wait for, no pending bubble, the draft is done.
+                if draft.trimmingCharacters(in: .whitespacesAndNewlines) == pending.text { draft = "" }
+                settlePending()
+                delivery = ""
+                showAutopilotNote(note)
+                return
+            }
             let outcome = result["outcome"] as? String ?? "received"
             if draft.trimmingCharacters(in: .whitespacesAndNewlines) == pending.text { draft = "" }
             contextPaths.subtract(pending.contextPaths)
@@ -2691,9 +2718,30 @@ import Network
     }
 }
 
-// MARK: Wave 3: the active gateway address (main or mesh)
+// MARK: Wave 3: autopilot notes and the active gateway address
+
+/// Which tab's navigation stack a programmatically opened thread is pushed on (§6.7).
+enum ThreadDestination {
+    case sessions
+    case summary
+}
 
 extension SessionManager {
+    func showAutopilotNote(_ message: String) {
+        autopilotNote = message
+        autopilotNoteTask?.cancel()
+        autopilotNoteTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled, let self, self.autopilotNote == message else { return }
+            self.autopilotNote = nil
+        }
+    }
+
+    func dismissAutopilotNote() {
+        autopilotNoteTask?.cancel(); autopilotNoteTask = nil
+        autopilotNote = nil
+    }
+
     /// The configured address (main or mesh) requests of the current connection go to.
     var activeEndpoint: String? {
         _ = routeRevision

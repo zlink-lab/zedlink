@@ -34,6 +34,9 @@ struct SettingsView: View {
                     }.accessibilityIdentifier("settings-connections")
                     ConnectionStatusView(state: session.state)
                     if session.showsZedControl { ZedSettingsRow() }
+                    NavigationLink { AutopilotSettingsView() } label: {
+                        SettingsSummary(title: "Автопилот", value: "Автопродолжение, лимиты, прогрев")
+                    }.accessibilityIdentifier("settings-autopilot")
                     NavigationLink("Diagnostics") { ConnectionDiagnosticsView() }
                     NavigationLink("Resume timing") { ResumeTimingView() }
                 }

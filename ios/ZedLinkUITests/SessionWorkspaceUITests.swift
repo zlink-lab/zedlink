@@ -15,6 +15,8 @@ final class SessionWorkspaceUITests: XCTestCase {
             throw XCTSkip("Set ZEDLINK_E2E_THREAD_ID to an exposed disposable thread, after pairing this simulator.")
         }
         let app = XCUIApplication(); app.launch()
+        // Summary is the first tab since wave 3; exposed threads are listed under Sessions.
+        if app.tabBars.buttons["Sessions"].waitForExistence(timeout: 10) { app.tabBars.buttons["Sessions"].tap() }
         let row = app.buttons["thread-" + thread]
         XCTAssertTrue(row.waitForExistence(timeout: 20), "Disposable test thread is unavailable; verify pairing, route, and exposure.")
         row.tap()
