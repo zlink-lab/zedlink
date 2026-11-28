@@ -55,3 +55,30 @@ systemctl --user enable --now zedlink-gateway-update.timer
 Check: `zedlink-gateway-update --check`, `journalctl --user -u zedlink-gateway-update`,
 `curl -sk https://<gateway>/v1/gateway` shows `build`. Updating the gateway drops phone
 connections for a few seconds; the app reconnects.
+
+## Second address: Yggdrasil mesh
+
+The same gateway (same `gateway_id`, same pairing) can also listen on its Yggdrasil address
+(`200::/7`). Add a second listener to `listeners.json` and give it a certificate whose SAN
+covers that IP:
+
+```json
+{"version": 1, "listeners": [
+  {"id": "lan",  "bind": "192.168.1.20:8443", "cert": "/…/lan.pem",  "key": "/…/lan-key.pem",
+   "url": "https://192.168.1.20:8443"},
+  {"id": "mesh", "bind": "[201:abcd:…:1]:8443", "cert": "/…/mesh.pem", "key": "/…/mesh-key.pem",
+   "url": "https://[201:abcd:…:1]:8443"}]}
+```
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 825 \
+  -subj "/CN=zedlink-mesh" -addext "subjectAltName=IP:201:abcd:…:1" \
+  -keyout mesh-key.pem -out mesh.pem && chmod 600 mesh-key.pem
+```
+
+A Yggdrasil address is reachable by every node of the mesh, not just your devices: bind only the
+gateway port to it (no other services on that address), and keep pairing + TLS as the
+authorization — reachability over the mesh grants nothing by itself. The phone stores it as
+"Mesh-адрес" and uses whichever of the two addresses answers with the expected `gateway_id`.
+`reload-tls` reloads both certificates.
+

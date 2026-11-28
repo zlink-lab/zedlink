@@ -831,7 +831,12 @@ fn private_ip(ip: IpAddr) -> bool {
                 || ip.is_private()
                 || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
         }
-        IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00 == 0xfc00),
+        // fc00::/7 unique local, 200::/7 Yggdrasil mesh (wave 3 §5).
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.segments()[0] & 0xfe00 == 0xfc00
+                || ip.segments()[0] & 0xfe00 == 0x0200
+        }
     }
 }
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -3088,6 +3093,25 @@ mod tests {
             push_heading(&json!({}), &json!({})),
             ("ZLink".to_owned(), None)
         );
+    }
+
+    #[test]
+    fn listeners_may_bind_private_and_mesh_addresses_only() {
+        for address in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "100.64.0.1",
+            "::1",
+            "fd7a:115c::1",
+            "200::1",
+            "201:abcd::1",
+            "3ff:ffff::1",
+        ] {
+            assert!(private_ip(address.parse().unwrap()), "{address}");
+        }
+        for address in ["8.8.8.8", "2001:db8::1", "400::1", "1ff::1", "fe80::1"] {
+            assert!(!private_ip(address.parse().unwrap()), "{address}");
+        }
     }
 
     #[test]
